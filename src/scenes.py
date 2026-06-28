@@ -18,7 +18,7 @@ import torch
 
 from .data.cie_tables import d65_spd
 from .forward import neumann_forward
-from .kernels import kernel_thinfilm, kernel_fluorescence
+from .kernels import kernel_thinfilm, kernel_fluorescence, check_hwp, fabry_airy_R
 from .sensor import Sensor, _torch_interp
 from .spectral_grid import SpectralGrid
 
@@ -69,6 +69,10 @@ def single_bounce_flat(
     if L_e is None:
         L_e = d65_on_grid(grid)
 
+    with torch.no_grad():
+        R = fabry_airy_R(grid.lam, cos_i, d, A, B, polarization)
+        check_hwp(R, torch.zeros_like(R), torch.zeros_like(R), grid.weights)
+
     K = kernel_thinfilm(grid.lam, cos_i, d, A, B, polarization)
     L = neumann_forward(K, L_e, max_depth)
     return ForwardResult(L=L, image=sensor.measure(L), K=K)
@@ -111,6 +115,13 @@ def two_bounce(
     """
     if L_e is None:
         L_e = d65_on_grid(grid)
+
+    with torch.no_grad():
+        R     = fabry_airy_R(grid.lam, cos_i, d, A, B, polarization)
+        a_raw = torch.exp(-0.5 * ((grid.lam - lam_ex) / sigma_f) ** 2)
+        e_raw = torch.exp(-0.5 * ((grid.lam - lam_em) / sigma_f) ** 2)
+        e_n   = e_raw / (e_raw * grid.weights).sum()
+        check_hwp(R, e_n, a_raw, grid.weights)
 
     K_tf = kernel_thinfilm(grid.lam, cos_i, d, A, B, polarization)
     K_fl = kernel_fluorescence(grid.lam, lam_ex, lam_em, sigma_f, grid.weights, quantum_yield)

@@ -4,15 +4,6 @@ from .fresnel import fresnel_rs, fresnel_rp
 
 
 # ---------------------------------------------------------------------------
-# Diagonal kernel
-# ---------------------------------------------------------------------------
-
-def kernel_diagonal(fr: torch.Tensor) -> torch.Tensor:
-    """K(λ,λ') = f_r(λ) δ(λ−λ'). Returns (N, N) diagonal matrix."""
-    return torch.diag(fr)
-
-
-# ---------------------------------------------------------------------------
 # Rank-1 fluorescence kernel
 # ---------------------------------------------------------------------------
 
@@ -114,6 +105,30 @@ def fabry_airy_R(
     return torch.where(tir, torch.ones_like(R), R)
 
 
+def _dR_dparam(
+    rs:         torch.Tensor,
+    rp:         torch.Tensor,
+    phi:        torch.Tensor,
+    tir:        torch.Tensor,
+    dphi_dp:    torch.Tensor,
+    polarization: str,
+) -> torch.Tensor:
+    """∂R/∂param = ∂R/∂φ · ∂φ/∂param, TIR-zeroed.  Internal helper."""
+    def _pol(r12):
+        denom2 = 1.0 + r12 ** 4 - 2.0 * r12 ** 2 * torch.cos(phi)   # |B|²
+        R      = _fabry_airy_pol(r12, phi)
+        dR_dphi = 2.0 * r12 ** 2 * torch.sin(phi) * (1.0 - R) / denom2
+        return dR_dphi * dphi_dp
+
+    if polarization == "s":
+        out = _pol(rs)
+    elif polarization == "p":
+        out = _pol(rp)
+    else:
+        out = 0.5 * (_pol(rs) + _pol(rp))
+    return torch.where(tir, torch.zeros_like(out), out)
+
+
 def fabry_airy_dR_dd(
     lam: torch.Tensor,
     cos_i,
@@ -124,36 +139,89 @@ def fabry_airy_dR_dd(
 ) -> torch.Tensor:
     """Analytic ∂R/∂d for air-film-air thin film (Eq. 15).
 
-    Derivation:
-        φ = 4π n cosθ_t d / λ  →  ∂φ/∂d = 4π n cosθ_t / λ
-        ∂R/∂φ = −2 r12 r23 sinφ (1−R) / |B|²,   r23 = −r12
-               = 2 r12² sinφ (1−R) / |B|²
-        ∂R/∂d = ∂R/∂φ · ∂φ/∂d
-
-    TIR wavelengths → ∂R/∂d = 0 (gradient dead zone).
-    Returns (N,).
+    φ = 4π n cosθ_t d / λ  →  ∂φ/∂d = 4π n cosθ_t / λ
+    TIR wavelengths → 0 (gradient dead zone).  Returns (N,).
     """
-    n = n_cauchy(lam, A, B)
+    n     = n_cauchy(lam, A, B)
     cos_t = cos_theta_t(cos_i, 1.0, n)
-    tir = is_tir(cos_i, 1.0, n)
+    tir   = is_tir(cos_i, 1.0, n)
     rs, rp, phi, _, _ = _r12_and_phi(lam, cos_i, d, A, B, polarization)
+    dphi_dd = 4.0 * torch.pi * n * cos_t / lam
+    return _dR_dparam(rs, rp, phi, tir, dphi_dd, polarization)
 
-    dphidd = 4.0 * torch.pi * n * cos_t / lam
 
-    def _dR_dd_pol(r12):
-        denom2 = (1.0 + r12 ** 4 - 2.0 * r12 ** 2 * torch.cos(phi))   # |B|²
-        R = _fabry_airy_pol(r12, phi)
-        dR_dphi = 2.0 * r12 ** 2 * torch.sin(phi) * (1.0 - R) / denom2
-        return dR_dphi * dphidd
+def fabry_airy_dR_dA(
+    lam: torch.Tensor,
+    cos_i,
+    d,
+    A: float,
+    B: float,
+    polarization: str = "unpolarized",
+) -> torch.Tensor:
+    """∂R_i/∂A for each wavelength via exact Jacobian through fabry_airy_R.
 
-    if polarization == "s":
-        dR_dd = _dR_dd_pol(rs)
-    elif polarization == "p":
-        dR_dd = _dR_dd_pol(rp)
-    else:
-        dR_dd = 0.5 * (_dR_dd_pol(rs) + _dR_dd_pol(rp))
+    Uses torch.autograd.functional.jacobian — captures both the phase term
+    ∂R/∂φ · ∂φ/∂A and the amplitude term ∂R/∂r12 · ∂r12/∂A. Returns (N,).
+    """
+    A_t = torch.tensor(float(A), dtype=lam.dtype, requires_grad=True)
+    J = torch.autograd.functional.jacobian(
+        lambda a: fabry_airy_R(lam, cos_i, d, a, B, polarization),
+        A_t, vectorize=True,
+    )
+    return J.detach()   # (N,)
 
-    return torch.where(tir, torch.zeros_like(dR_dd), dR_dd)
+
+def fabry_airy_dR_dB(
+    lam: torch.Tensor,
+    cos_i,
+    d,
+    A: float,
+    B: float,
+    polarization: str = "unpolarized",
+) -> torch.Tensor:
+    """∂R_i/∂B for each wavelength via exact Jacobian through fabry_airy_R.
+
+    Captures both the phase term ∂R/∂φ · ∂φ/∂B and the amplitude term
+    ∂R/∂r12 · ∂r12/∂B.  Returns (N,).
+    """
+    B_t = torch.tensor(float(B), dtype=lam.dtype, requires_grad=True)
+    J = torch.autograd.functional.jacobian(
+        lambda b: fabry_airy_R(lam, cos_i, d, A, b, polarization),
+        B_t, vectorize=True,
+    )
+    return J.detach()   # (N,)
+
+
+# ---------------------------------------------------------------------------
+# Well-posedness check (H_wp, §3)
+# ---------------------------------------------------------------------------
+
+def check_hwp(
+    R:       torch.Tensor,
+    e:       torch.Tensor,
+    a:       torch.Tensor,
+    weights: torch.Tensor,
+    eps:     float = 1e-3,
+) -> None:
+    """Assert H_wp: sup_λ R(λ) + ‖e‖₂·‖a‖₂ ≤ 1 − ε.
+
+    Raises ValueError if violated. Call at scene load before any solve.
+
+    R:       (N,) Fabry-Airy reflectance (from fabry_airy_R)
+    e:       (N,) normalized emission profile
+    a:       (N,) absorption profile (unnormalized peak-1 Gaussian)
+    weights: (N,) quadrature weights (for L² norm via ‖f‖₂² = Σ f²·w)
+    eps:     minimum margin below 1 (default 1e-3)
+    """
+    sup_R   = R.max().item()
+    norm_e  = ((e ** 2 * weights).sum()) ** 0.5
+    norm_a  = ((a ** 2 * weights).sum()) ** 0.5
+    total   = sup_R + norm_e.item() * norm_a.item()
+    if total > 1.0 - eps:
+        raise ValueError(
+            f"H_wp violated: sup R + ||e||*||a|| = {total:.6f} > 1 - eps = {1.0 - eps:.6f}. "
+            "Reduce reflectance or fluorescence strength."
+        )
 
 
 # ---------------------------------------------------------------------------

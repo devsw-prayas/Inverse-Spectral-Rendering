@@ -1,6 +1,4 @@
 import torch
-from pathlib import Path
-from .data.cie_tables import cie1931_cmf
 
 
 class Sensor:
@@ -20,13 +18,6 @@ class Sensor:
     def measure(self, L: torch.Tensor) -> torch.Tensor:
         """L: (..., N) -> (..., M)"""
         return L @ self.S.T
-
-    @classmethod
-    def from_file(cls, path: str | Path) -> "Sensor":
-        return cls(torch.load(path, weights_only=True))
-
-    def save(self, path: str | Path):
-        torch.save(self.S, path)
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +42,14 @@ def _torch_interp(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.
 
 
 def _raised_cosine(lam: torch.Tensor, centers: torch.Tensor, fwhm: float) -> torch.Tensor:
-    """Raised-cosine band responses. Returns S (M, N)."""
+    """Raised-cosine band responses with correct FWHM. Returns S (M, N).
+
+    Half-max lands at delta = +/-fwhm/2: S(fwhm/2) = 0.5(1+cos(pi/2)) = 0.5 (correct)
+    Support is |δ| ≤ fwhm (total width = 2×fwhm).
+    """
     delta = lam.unsqueeze(0) - centers.unsqueeze(1)  # (M, N)
-    half = fwhm / 2.0
-    S = 0.5 * (1.0 + torch.cos(torch.pi * delta / half))
-    return torch.where(delta.abs() <= half, S, torch.zeros_like(S))
+    S = 0.5 * (1.0 + torch.cos(torch.pi * delta / fwhm))
+    return torch.where(delta.abs() <= fwhm, S, torch.zeros_like(S))
 
 
 # ---------------------------------------------------------------------------
@@ -70,19 +64,3 @@ def hyperspectral_fx10(lam: torch.Tensor, M: int = 120) -> Sensor:
     return Sensor(_raised_cosine(lam, centers, fwhm))
 
 
-def hyperspectral_snapshot(lam: torch.Tensor, M: int = 25, fwhm: float = 15.0) -> Sensor:
-    """Snapshot-mosaic: M=25 channels, FWHM≈15 nm (D13 ablation lower bound)."""
-    lam_min, lam_max = lam[0].item(), lam[-1].item()
-    centers = torch.linspace(lam_min, lam_max, M, dtype=lam.dtype, device=lam.device)
-    return Sensor(_raised_cosine(lam, centers, fwhm))
-
-
-def rgb_cie1931(lam: torch.Tensor, weights: torch.Tensor) -> Sensor:
-    """CIE 1931 2° CMF sensor. weights are the λ²Δν̃ quadrature weights (N,).
-
-    S[i, k] = CMF_i(λ_k) · w_k  so that  (S @ L)[i] ≈ ∫ CMF_i(λ) L(λ) dλ.
-    """
-    lam_tab, cmf_tab = cie1931_cmf(device=lam.device)
-    cmf = _torch_interp(lam, lam_tab, cmf_tab)       # (N, 3)
-    S = (cmf * weights.unsqueeze(-1)).T               # (3, N)
-    return Sensor(S)

@@ -78,6 +78,40 @@ def solid_angle_ratio(
     return (n_i / n_t) ** 2 * cos_i / cos_t
 
 
+def tir_jacobian(
+    v:     torch.Tensor,
+    n_i:   torch.Tensor,
+    n_t:   torch.Tensor,
+    cos_i: torch.Tensor,
+    polarization: str = "unpolarized",
+) -> torch.Tensor:
+    """TIR-safe scalar J_TIR(v) = T_Fresnel(v) · η²c/v  (Theorem 3).
+
+    The 0×∞ at v = cosθ_t → 0 resolves analytically to a finite limit:
+        J_TIR^s(0) = 4η,   J_TIR^p(0) = 4η³
+
+    Closed forms (real-analytic at v = 0):
+        J_TIR^s(v) = 4η³c² / (ηc + v)²
+        J_TIR^p(v) = 4η³c² / (c + ηv)²
+
+    Derived from T_s = 4ηcv/(ηc+v)² and T_p = 4ηcv/(c+ηv)² multiplied by
+    the solid-angle det η²c/v — the v cancels exactly, leaving rational forms.
+
+    v:     (N,)  cosθ_t, must be ≥ 0 (TIR wavelengths should be masked by caller)
+    n_i, n_t, cos_i: (N,)
+    Returns (N,).
+    """
+    eta = n_i / n_t
+    c   = cos_i
+    J_s = 4.0 * eta ** 3 * c ** 2 / (eta * c + v) ** 2
+    J_p = 4.0 * eta ** 3 * c ** 2 / (c + eta * v) ** 2
+    if polarization == "s":
+        return J_s
+    elif polarization == "p":
+        return J_p
+    return 0.5 * (J_s + J_p)
+
+
 def snell_jacobian_tir_safe(
     v:     torch.Tensor,
     n_i:   torch.Tensor,
@@ -90,27 +124,32 @@ def snell_jacobian_tir_safe(
     1/cosθ_t singularity. The combined factor is:
 
         F(v) = α (I − n̂n̂ᵀ) + β n̂n̂ᵀ
-        α = v / cosθ_i(v),   β = n_i / n_t
+        η     = n_i / n_t
+        α     = v / (η · cosθ_i(v))      tangential eigenvalue
+        β     = 1                         normal eigenvalue (singularities cancel)
         cosθ_i(v) = sqrt(n_i² − n_t²(1 − v²)) / n_i
 
-    At v = 0 (TIR onset, cosθ_t → 0):  F(0) = (n_i/n_t) n̂n̂ᵀ  — finite.
+    Derivation: J tangential = η, J normal = η² cosθ_i/v,
+    |∂cosθ_i/∂v| = v/(η² cosθ_i); multiplying gives α and β above.
+
+    At v = 0 (TIR onset):  F(0) = n̂n̂ᵀ  — finite.
 
     v:         (N,) cosθ_t values in [0, 1]
     n_i, n_t:  (N,)
     n_hat:     (3,)
     Returns:   (N, 3, 3)
     """
-    N = n_i.shape[0]
+    N   = n_i.shape[0]
+    eta = n_i / n_t                                             # (N,)
 
     # cosθ_i as a function of v = cosθ_t via Snell: n_i sinθ_i = n_t sinθ_t
     cos_i_v = torch.sqrt(
         (n_i**2 - n_t**2 * (1.0 - v**2)).clamp(min=0.0)
     ) / n_i                                                     # (N,)
 
-    # α = v / cosθ_i(v); at v=0, numerator=0, cosθ_i(0)=sqrt(n_i²-n_t²)/n_i ≠ 0
-    # so α(0)=0 naturally — clamp denominator only for n_i ≈ n_t edge case
-    alpha = v / cos_i_v.clamp(min=1e-30)                       # (N,)
-    beta  = n_i / n_t                                           # (N,)
+    # α = v / (η cosθ_i(v)); numerator → 0 at v=0, denominator finite → α(0) = 0
+    alpha = v / (eta * cos_i_v).clamp(min=1e-30)               # (N,)
+    beta  = torch.ones(N, dtype=n_i.dtype, device=n_i.device)  # (N,)
 
     I3    = torch.eye(3, dtype=n_i.dtype, device=n_i.device)
     nnT   = torch.outer(n_hat, n_hat)                           # (3, 3)
