@@ -1,17 +1,4 @@
-"""Gradient utilities for the bispectral forward oracle.
-
-Three gradient paths for Tier 1-2 three-way comparison tests (A0-C9):
-  1. Autograd  — .backward() through neumann_forward, always available
-  2. Analytic  — kernel_gradient() using explicit ∂T/∂θ formulas
-  3. FD        — fd_gradient(), ground truth at ~h=1e-6|θ|
-
-For thin-film ∂/∂d, the analytic ∂T/∂d is diagonal (fabry_airy_dR_dd).
-For fluorescence ∂/∂lam_em, the analytic ∂T/∂lam_em is rank-1.
-
-Wrong-gradient oracle (Test B7-spectral):
-  kernel_fluorescence_half_attached — detaches the normalization constant C
-  so autograd misses the ∂C/∂lam_em quotient-rule term, giving a biased gradient.
-"""
+"""Gradient utilities for the bispectral forward oracle."""
 
 from __future__ import annotations
 
@@ -36,8 +23,9 @@ def fd_gradient(
            current value. Must not close over any other requires_grad tensors
            that depend on param — use torch.no_grad() internally if needed.
     param: 0-dim (scalar) tensor — temporarily perturbed in place.
-    h:     step; defaults to max(1e-6 |param|, 1e-6). At float64 this gives
-           an FD floor of ~h² ≈ 1e-12 relative error (expected FD floor).
+    h:     step; defaults to max(1e-6 |param|, 1e-6). At float64, roundoff
+           error ε/h dominates at this step size, giving a realistic FD
+           floor of ~1e-9 relative error — not ~h² ≈ 1e-12 (truncation only).
 
     Returns a detached scalar tensor.
     """
@@ -89,7 +77,7 @@ def neumann_adjoint(
 
 def kernel_gradient(
     T:         torch.Tensor,
-    dT_dθ:    torch.Tensor,
+    dT_dtheta:    torch.Tensor,
     L_e:       torch.Tensor,
     g:         torch.Tensor,
     max_depth: int,
@@ -100,7 +88,7 @@ def kernel_gradient(
     At max_depth = 32 and ρ ≲ 0.4, error < 10^{-18} — below float64 floor.
 
     T:        (N, N) operator matrix
-    dT_dθ:   (N,) or (N, N)
+    dT_dtheta:   (N,) or (N, N)
               Pass (N,) for diagonal ∂T/∂θ (thin-film ∂/∂d, ∂/∂A, ∂/∂B).
               Pass (N, N) for dense ∂T/∂θ (fluorescence rank-1 matrices).
     L_e:      (N,) source radiance
@@ -117,16 +105,40 @@ def kernel_gradient(
     L = neumann_forward(T, L_e, max_depth)   # (N,) primal radiance
     G = neumann_adjoint(T, g, max_depth)     # (N,) adjoint radiance
 
-    if dT_dθ.dim() == 1:
-        # Diagonal: G^T diag(dT_dθ) L = (G ⊙ dT_dθ ⊙ L).sum()
-        return (G * dT_dθ * L).sum().detach()
+    if dT_dtheta.dim() == 1:
+        # Diagonal: G^T diag(dT_dtheta) L = (G ⊙ dT_dtheta ⊙ L).sum()
+        return (G * dT_dtheta * L).sum().detach()
     else:
-        # Dense: G^T (dT_dθ @ L)
-        return (G @ (dT_dθ @ L)).detach()
+        # Dense: G^T (dT_dtheta @ L)
+        return (G @ (dT_dtheta @ L)).detach()
+
+
+def kernel_gradient_wrong_adjoint(
+    T:         torch.Tensor,
+    dT_dtheta:    torch.Tensor,
+    L_e:       torch.Tensor,
+    g:         torch.Tensor,
+    max_depth: int,
+) -> torch.Tensor:
+    """Wrong gradient: adjoint sourced by (∂T/∂θ)L instead of S.
+
+    Solves (I − T^T) G_wrong = (∂T/∂θ)L, then returns g · G_wrong.
+    Equals the correct gradient only when T = T^T (zero Stokes shift).
+    For fluorescence with a Stokes shift, gives ~half the correct value.
+
+    Same signature as kernel_gradient — swap in to isolate the bug.
+    """
+    L = neumann_forward(T, L_e, max_depth)
+    if dT_dtheta.dim() == 1:
+        source = dT_dtheta * L
+    else:
+        source = dT_dtheta @ L
+    G_wrong = neumann_adjoint(T, source, max_depth)
+    return (g @ G_wrong).detach()
 
 
 # ---------------------------------------------------------------------------
-# Wrong-gradient oracle — Test B7-spectral
+# Wrong-gradient oracle — Test B7-spectral / C8
 # ---------------------------------------------------------------------------
 
 def kernel_fluorescence_half_attached(
@@ -159,7 +171,7 @@ def kernel_fluorescence_half_attached(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: ∂loss/∂lam_em for fluorescence kernel via analytic formula
+# Analytic fluorescence kernel derivatives
 # ---------------------------------------------------------------------------
 
 def fluorescence_dK_dlam_em(
@@ -190,3 +202,110 @@ def fluorescence_dK_dlam_em(
 
     aw = a * weights
     return quantum_yield * de.unsqueeze(1) * aw.unsqueeze(0)      # (N, N)
+
+
+def fluorescence_dK_dlam_ex(
+    lam:     torch.Tensor,
+    lam_ex:  torch.Tensor | float,
+    lam_em:  torch.Tensor | float,
+    sigma_f: torch.Tensor | float,
+    weights: torch.Tensor,
+    quantum_yield: float = 1.0,
+) -> torch.Tensor:
+    """Analytic ∂K_fl/∂lam_ex — (N, N) matrix.
+
+    Only the absorption profile a(λ') changes; emission e(λ) is independent.
+    ∂a_j/∂lam_ex = a_j · (λ_j − lam_ex) / σ²
+    """
+    sigma2 = sigma_f ** 2
+    a      = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)
+    e_raw  = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)
+    C      = (e_raw * weights).sum()
+    e      = e_raw / C
+
+    da     = a * (lam - lam_ex) / sigma2                          # ∂a/∂lam_ex  (N,)
+    daw    = da * weights
+    return quantum_yield * e.unsqueeze(1) * daw.unsqueeze(0)      # (N, N)
+
+
+def fluorescence_dK_dsigma_f(
+    lam:     torch.Tensor,
+    lam_ex:  torch.Tensor | float,
+    lam_em:  torch.Tensor | float,
+    sigma_f: torch.Tensor | float,
+    weights: torch.Tensor,
+    quantum_yield: float = 1.0,
+) -> torch.Tensor:
+    """Analytic ∂K_fl/∂sigma_f — (N, N) matrix.
+
+    Both a and e (through C) change.
+    ∂a/∂σ  = a · (λ−lam_ex)² / σ³
+    ∂e/∂σ  = (1/C)[∂e_raw/∂σ − e · ∂C/∂σ]   (quotient rule, same pattern as ∂/∂lam_em)
+    """
+    sigma2 = sigma_f ** 2
+    sigma3 = sigma_f ** 3
+
+    a      = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)
+    e_raw  = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)
+    C      = (e_raw * weights).sum()
+    e      = e_raw / C
+
+    da_ds      = a * (lam - lam_ex) ** 2 / sigma3
+    de_raw_ds  = e_raw * (lam - lam_em) ** 2 / sigma3
+    dC_ds      = (de_raw_ds * weights).sum()
+    de_ds      = (de_raw_ds - e * dC_ds) / C
+
+    aw  = a * weights
+    daw = da_ds * weights
+    return quantum_yield * (
+        de_ds.unsqueeze(1) * aw.unsqueeze(0)
+        + e.unsqueeze(1) * daw.unsqueeze(0)
+    )                                                              # (N, N)
+
+
+# ---------------------------------------------------------------------------
+# Moving-boundary gradient (§13) — scope {A, B} only
+# ---------------------------------------------------------------------------
+
+def lambda_star(
+    A:     torch.Tensor | float,
+    B:     torch.Tensor | float,
+    cos_i: torch.Tensor | float,
+) -> torch.Tensor:
+    """Critical wavelength λ*(A,B) = sqrt(B / (κ − A)),  κ = 1/sinθᵢ.
+
+    The TIR critical condition n(λ*)sinθᵢ = 1 with n(λ) = A + B/λ² gives this
+    closed form. Returns a scalar tensor.
+    """
+    sin_i = (1.0 - cos_i ** 2) ** 0.5
+    kappa = 1.0 / sin_i
+    return (B / (kappa - A)) ** 0.5
+
+
+def dlambda_star_dA(
+    lam_star: torch.Tensor | float,
+    B:        torch.Tensor | float,
+) -> torch.Tensor:
+    """dλ*/dA = λ*³ / (2B)."""
+    return lam_star ** 3 / (2.0 * B)
+
+
+def dlambda_star_dB(
+    lam_star: torch.Tensor | float,
+    B:        torch.Tensor | float,
+) -> torch.Tensor:
+    """dλ*/dB = λ* / (2B)."""
+    return lam_star / (2.0 * B)
+
+
+def moving_boundary_grad(
+    e_at_star:       torch.Tensor | float,
+    dlam_star_dtheta: torch.Tensor | float,
+) -> torch.Tensor:
+    """Moving-boundary contribution to ∂I/∂θ: −e(λ*) · dλ*/dθ.
+
+    Scope: θ ∈ {A, B} only — the only parameters that move the critical
+    wavelength λ*. Returns a scalar. e_at_star is the (normalized) emission
+    profile evaluated at λ*; dlam_star_dtheta from dlambda_star_dA/dB.
+    """
+    return -e_at_star * dlam_star_dtheta
