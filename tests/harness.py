@@ -43,6 +43,12 @@ class GradResult:
         return True
 
 
+class OpenTheoreticalQuestion(Exception):
+    """Raised by a test whose theory is not yet resolved -- distinct from
+    NotImplementedError, which means 'known result, not coded up yet.'
+    Runners must report these as OPEN, not SKIP."""
+
+
 @dataclass
 class StructResult:
     test_id:  str
