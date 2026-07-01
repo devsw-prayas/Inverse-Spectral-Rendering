@@ -646,15 +646,102 @@ def test_T12() -> list[StructResult]:
 
 
 # ---------------------------------------------------------------------------
-# T13: Substrate-side TIR clipping (concrete latent bug)
-# Claim (ss8): The clip(cos,0,None) in the substrate-side Fresnel computation
-#              smooths a genuine non-smoothness in R(lambda) into a plausible-
-#              looking wrong answer. Test that the gradient estimator handles
-#              the real discontinuity instead.
+# T13: Substrate-side TIR clipping -- autograd-vs-FD gradient kink
+# Claim (ss8): R(lambda) magnitude itself cannot expose this bug in a 3-medium
+#              stack -- whenever |r23|=1 (true for both the buggy real r23=1
+#              and the correct complex r23=e^{i theta}), the Fabry-Airy formula
+#              gives R=1 identically regardless of arg(r23) (numerator equals
+#              denominator algebraically). So R is flat=1 on both sides of the
+#              substrate-side critical point by energy conservation; the clip
+#              never touches the observable *value*.
+#              The real bug is in the DERIVATIVE. cos_theta_t's
+#              clamp(under, min=0.0) has zero backward gradient in the clamped
+#              (TIR) branch, and at the critical point itself (under=0 exactly)
+#              PyTorch's clamp backward uses the strict mask (x > min), so
+#              autograd through the actual library cos_theta_t returns exactly
+#              0 there. But R(A_sub) genuinely has a kink at that point: on the
+#              propagating side it varies (with a steep/vertical tangent as
+#              A_sub -> critical), then goes exactly flat past it. Autograd
+#              evaluated safely INSIDE the TIR region reports a clean, exact
+#              0.0 (the clamp masks it) -- but a finite parameter step large
+#              enough to cross back over the critical boundary reveals real,
+#              nonzero sensitivity. Local autograd cannot see this because it
+#              is blind to a nearby domain-boundary crossing; this is the
+#              direct analog of T12's moving-boundary miss, at the
+#              film->substrate interface instead of a TIR-in-glass boundary.
+#              (Landmine note: evaluating autograd at the EXACT bit-for-bit
+#              critical point, under=0.0 precisely, makes sqrt's own backward
+#              singular and clamp's mask permissive there, producing literal
+#              +-inf instead of 0 -- confirmed manually, not asserted here
+#              since it depends on hitting that coincidence exactly.)
 # ---------------------------------------------------------------------------
 
-def test_T13() -> StructResult:
-    raise NotImplementedError("T13")
+def test_T13() -> list[StructResult]:
+    from src.cauchy_ior import cos_theta_t
+    from src.fresnel import fresnel_rs
+
+    # n_film=2.0, n_sub=1.5, internal film angle chosen so the substrate-side
+    # critical angle occurs exactly at n_sub=1.5 (sin_f = n_sub/n_f = 0.75).
+    n_f      = 2.0
+    sin_f    = 0.75
+    cos_f    = (1.0 - sin_f ** 2) ** 0.5
+    A_crit   = 1.5           # substrate index at which the interface goes critical
+    A_eval   = 1.4           # observation point, safely inside the TIR region
+    d_film   = 120.0
+    lam0     = 550.0
+    r12      = 0.2           # fixed top-interface amplitude (toy, not re-derived)
+
+    phi   = 4.0 * torch.pi * n_f * cos_f * d_film / lam0     # constant (independent of A_sub)
+    eiphi = complex(torch.cos(torch.tensor(phi)).item(), torch.sin(torch.tensor(phi)).item())
+
+    def R_of_Asub(A_sub: torch.Tensor) -> torch.Tensor:
+        # uses the ACTUAL library cos_theta_t -- same clamp as production code.
+        cos_sub = cos_theta_t(torch.tensor(cos_f, dtype=torch.float64), n_f, A_sub)
+        r23     = fresnel_rs(n_f, A_sub, cos_f, cos_sub)
+        r23c    = r23.to(torch.complex128)
+        num = (r12 + r23c * eiphi).abs() ** 2
+        den = (1.0 + r12 * r23c * eiphi).abs() ** 2
+        return num / den
+
+    # autograd, evaluated safely inside the TIR region (not the exact boundary)
+    A_ag = torch.tensor(A_eval, dtype=torch.float64, requires_grad=True)
+    R_of_Asub(A_ag).backward()
+    grad_autograd = A_ag.grad.item()
+
+    # FD step large enough to cross back over A_crit=1.5 into the propagating side
+    h = A_crit - A_eval + 0.05   # = 0.15: A_eval+h=1.55 (propagating), A_eval-h=1.25 (flat TIR)
+    with torch.no_grad():
+        R_plus  = R_of_Asub(torch.tensor(A_eval + h, dtype=torch.float64)).item()
+        R_minus = R_of_Asub(torch.tensor(A_eval - h, dtype=torch.float64)).item()
+    grad_fd = (R_plus - R_minus) / (2.0 * h)
+
+    # sanity: R is exactly flat (=1) on the TIR side at A_eval-h, confirming the
+    # observable magnitude itself carries no signal -- only the derivative does.
+    flat_tir_err = abs(R_minus - 1.0)
+
+    rel_discrepancy = abs(grad_fd - grad_autograd) / (abs(grad_fd) + 1e-30)
+
+    return [
+        StructResult(
+            "T13", "R is exactly flat (=1) on TIR side (energy conservation)",
+            flat_tir_err, 0.0, flat_tir_err, 1e-9,
+            flat_tir_err < 1e-9,
+            f"R(A_eval-h)={R_minus:.12f} -- confirms bug is not visible in R's value",
+        ),
+        StructResult(
+            "T13", "autograd through clip = 0 inside TIR region",
+            abs(grad_autograd), 0.0, abs(grad_autograd), 1e-9,
+            abs(grad_autograd) < 1e-9,
+            f"dR/dA_sub (autograd) = {grad_autograd:.6e} at A_sub={A_eval} (TIR side, not the exact kink)",
+        ),
+        StructResult(
+            "T13", "FD across the nearby boundary is clearly nonzero (moving-boundary miss)",
+            rel_discrepancy, 0.0, rel_discrepancy, 0.9,
+            rel_discrepancy > 0.9,
+            f"grad_fd={grad_fd:.4f} (h={h}, crosses A_crit={A_crit}) vs autograd={grad_autograd:.2e} -- "
+            f"local autograd is blind to the nearby domain-boundary crossing",
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
