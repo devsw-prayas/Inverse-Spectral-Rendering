@@ -746,26 +746,161 @@ def test_T13() -> list[StructResult]:
 
 # ---------------------------------------------------------------------------
 # T14: Emission-line truncation degrades Theorem 7 invariance
-# Claim (ss9/14): The exact-invariance proof assumes integration over all lambda'.
-#                 The renderer integrates over [lambda_min, lambda_max] only.
-#                 As lambda_em approaches lambda_max (or lambda_em + k*sigma_f
-#                 exits the band), invariance should measurably degrade.
-#                 Must be documented as a real boundary of the theorem.
+# Claim (ss9): Theorem 7 (lam_ex exactly unresolvable) relies on
+#              abar = integral a(lam';lam_ex,sigma_f) dlam' over ALL lam' being
+#              lam_ex-independent (Gaussian translation invariance on an
+#              unbounded domain). kernel_fluorescence computes this same sum
+#              (a * weights, unnormalized) over the finite rendered grid
+#              [lam_min, lam_max] only. Deep in-band this recovers the
+#              closed-form sqrt(2*pi)*sigma_f to machine precision and the
+#              gradient wrt lam_ex is genuinely ~0 (Theorem 7 holds in
+#              practice). As lam_ex approaches lam_max, the truncated tail
+#              is lost and both the value and its lam_ex-gradient depart
+#              measurably from the untruncated theorem -- a real scope
+#              boundary, not a numerical artifact (grid resolved far finer
+#              than sigma_f throughout).
 # ---------------------------------------------------------------------------
 
-def test_T14() -> StructResult:
-    raise NotImplementedError("T14")
+def test_T14() -> list[StructResult]:
+    import math
+    from src.kernels import kernel_fluorescence
+
+    lam_min, lam_max, N = 360.0, 830.0, 4000
+    lam  = torch.linspace(lam_min, lam_max, N, dtype=torch.float64)
+    dlam = (lam_max - lam_min) / (N - 1)
+    w    = torch.full((N,), dlam, dtype=torch.float64)
+    w[0] *= 0.5
+    w[-1] *= 0.5
+
+    sigma_f     = 15.0
+    lam_em      = 500.0                             # arbitrary; abar doesn't depend on it
+    untrunc_ref = math.sqrt(2.0 * math.pi) * sigma_f  # closed-form, unbounded-domain abar
+
+    def abar_trunc(lam_ex: torch.Tensor) -> torch.Tensor:
+        # (kernel_fluorescence uses e normalized so sum(e*w)=1 by construction,
+        # so weighting the emission axis by w and summing extracts exactly
+        # sum_j a_j * w_j -- the finite-window analog of Theorem 7's abar.)
+        K = kernel_fluorescence(lam, lam_ex, lam_em, sigma_f, w, quantum_yield=1.0)
+        return (K * w.unsqueeze(0)).sum()
+
+    def eval_at(lam_ex_val: float) -> tuple[float, float]:
+        t = torch.tensor(lam_ex_val, dtype=torch.float64, requires_grad=True)
+        val = abar_trunc(t)
+        val.backward()
+        return val.item(), t.grad.item()
+
+    val_deep, grad_deep = eval_at(595.0)             # ~15.6 sigma_f from either edge
+    val_near, grad_near = eval_at(825.0)             # 5nm = 0.33 sigma_f from lam_max
+
+    rel_err_deep = abs(val_deep - untrunc_ref) / untrunc_ref
+    rel_err_near = abs(val_near - untrunc_ref) / untrunc_ref
+
+    sweep = [700.0, 800.0, 820.0, 825.0, 829.0]
+    grads = [eval_at(v)[1] for v in sweep]
+
+    return [
+        StructResult(
+            "T14", "abar_trunc matches untruncated theorem deep in-band",
+            val_deep, untrunc_ref, rel_err_deep, 1e-9,
+            rel_err_deep < 1e-9,
+            f"lam_ex=595nm (15.6 sigma_f from edges): abar={val_deep:.6f} vs sqrt(2pi)*sigma_f={untrunc_ref:.6f}",
+        ),
+        StructResult(
+            "T14", "d(abar_trunc)/d(lam_ex) ~ 0 deep in-band (Theorem 7 holds)",
+            abs(grad_deep), 0.0, abs(grad_deep), 1e-9,
+            abs(grad_deep) < 1e-9,
+            f"grad={grad_deep:.3e} at lam_ex=595nm -- exact invariance confirmed away from edges",
+        ),
+        StructResult(
+            "T14", "invariance measurably degrades near lam_max (real scope boundary)",
+            rel_err_near, 0.0, rel_err_near, 0.1,
+            rel_err_near > 0.1,
+            f"lam_ex=825nm (0.33 sigma_f from edge): abar={val_near:.4f}, rel err {100*rel_err_near:.1f}% "
+            f"vs untruncated theorem; grad={grad_near:.4f} (not 0) -- monotone growth: "
+            + " ".join(f"{g:.3f}" for g in grads),
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
 # T15: kappa -> inf at normal incidence
-# Claim (ss13): As theta_i -> 0, kappa = 1/sin(theta_i) -> inf and lambda*
-#               leaves the band. Moving-boundary term must go to exactly 0,
-#               not produce a 0*inf in the dlambda*/dtheta formulas.
+# Claim (ss13): As theta_i -> 0, kappa = 1/sin(theta_i) -> inf and lambda*(A,B)
+#               -> 0, leaving the band entirely. Verified numerically: the
+#               CLOSED-FORM derivatives dlambda_star_dA/dB = lam_star^3/(2B)
+#               and lam_star/(2B) degrade gracefully -- they agree with naive
+#               autograd through lambda_star() away from exact normal
+#               incidence, and both reduce to a clean exact 0.0 right at
+#               cos_i=1.0 (since lam_star itself is a clean finite 0.0 there,
+#               forward pass never divides by literal inf incorrectly).
+#               In CONTRAST, differentiating straight through lambda_star()
+#               via autograd AT EXACTLY cos_i=1.0 hits a genuine 0*inf: kappa
+#               becomes literal float('inf') (1.0/0.0), sqrt's own backward is
+#               singular at its zero output, and inf*0 -> NaN. This confirms
+#               why the codebase provides dlambda_star_dA/dB as separate
+#               closed-form functions (taking the already-computed lam_star)
+#               rather than relying on autograd through the raw formula.
 # ---------------------------------------------------------------------------
 
-def test_T15() -> StructResult:
-    raise NotImplementedError("T15")
+def test_T15() -> list[StructResult]:
+    import math
+    from src.gradient import lambda_star, dlambda_star_dA, dlambda_star_dB, moving_boundary_grad
+
+    A_val, B_val = 1.5, 5000.0
+
+    # sweep toward normal incidence -- closed form vs naive autograd should agree
+    cos_i_vals = [0.9, 0.99, 0.999, 0.99999]
+    max_rel_err = 0.0
+    for c in cos_i_vals:
+        cos_i = torch.tensor(c, dtype=torch.float64)
+        ls = lambda_star(A_val, B_val, cos_i)
+        closed = dlambda_star_dA(ls, B_val).item()
+
+        A_t = torch.tensor(A_val, dtype=torch.float64, requires_grad=True)
+        lambda_star(A_t, B_val, cos_i).backward()
+        naive = A_t.grad.item()
+
+        max_rel_err = max(max_rel_err, abs(closed - naive) / (abs(naive) + 1e-30))
+
+    # exactly at normal incidence
+    cos_i_exact = torch.tensor(1.0, dtype=torch.float64)
+    ls0 = lambda_star(A_val, B_val, cos_i_exact)
+    closed_dA0 = dlambda_star_dA(ls0, B_val).item()
+    closed_dB0 = dlambda_star_dB(ls0, B_val).item()
+
+    A_exact = torch.tensor(A_val, dtype=torch.float64, requires_grad=True)
+    lambda_star(A_exact, B_val, cos_i_exact).backward()
+    naive_at_exact = A_exact.grad.item()
+
+    mbg = moving_boundary_grad(0.02, closed_dA0)   # e_at_star bounded/arbitrary -- shouldn't matter
+
+    return [
+        StructResult(
+            "T15", "closed-form dlambda_star_dA matches naive autograd away from cos_i=1",
+            max_rel_err, 0.0, max_rel_err, 1e-6,
+            max_rel_err < 1e-6,
+            f"lam_star at cos_i=0.9..0.99999: {lambda_star(A_val, B_val, torch.tensor(0.9)).item():.3f} -> "
+            f"{lambda_star(A_val, B_val, torch.tensor(0.99999)).item():.3f} nm (shrinking toward 0)",
+        ),
+        StructResult(
+            "T15", "closed-form dlambda_star_dA/dB -> exact 0 at cos_i=1 (no 0*inf)",
+            abs(closed_dA0) + abs(closed_dB0), 0.0, abs(closed_dA0) + abs(closed_dB0), 1e-12,
+            (closed_dA0 == 0.0) and (closed_dB0 == 0.0),
+            f"lam_star(cos_i=1.0)={ls0.item()}; dA={closed_dA0}, dB={closed_dB0} -- clean, finite",
+        ),
+        StructResult(
+            "T15", "naive autograd through lambda_star is NaN at exact cos_i=1 (landmine, confirms need for closed form)",
+            1.0 if math.isnan(naive_at_exact) else 0.0, None, None, 0.5,
+            math.isnan(naive_at_exact),
+            f"naive autograd dlambda_star/dA at cos_i=1.0 exactly = {naive_at_exact} "
+            f"(kappa=1/sin_i overflows to literal inf; sqrt backward singular at 0; inf*0 = NaN)",
+        ),
+        StructResult(
+            "T15", "moving_boundary_grad -> exactly 0 at normal incidence via closed-form path",
+            abs(mbg), 0.0, abs(mbg), 1e-12,
+            mbg == 0.0,
+            f"moving_boundary_grad(e_at_star=0.02, dlam_star_dA=0.0) = {mbg} -- graceful, not 0*inf",
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
