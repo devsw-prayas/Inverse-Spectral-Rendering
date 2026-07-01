@@ -31,7 +31,7 @@ import sys
 import torch
 torch.set_default_dtype(torch.float64)
 
-from tests.harness import Reporter, StructResult
+from tests.harness import Reporter, StructResult, OpenTheoreticalQuestion
 
 
 # ---------------------------------------------------------------------------
