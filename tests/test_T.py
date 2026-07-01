@@ -480,8 +480,70 @@ def test_T9() -> list[StructResult]:
 #               (hard wall), not just very large condition number.
 # ---------------------------------------------------------------------------
 
-def test_T11() -> StructResult:
-    raise NotImplementedError("T11")
+def test_T11() -> list[StructResult]:
+    # 2-fluorophore model: L_fl = w1*e1*abar + w2*e2*abar
+    # Parameters: (w1, w2, lam_em1, lam_em2)
+    # At exact coincidence lam_em1=lam_em2, e1=e2 in float64 -> col_w1=col_w2 EXACTLY
+    # -> sigma_min = 0 (hard wall), not just a very large condition number.
+
+    lam    = torch.linspace(400.0, 700.0, 80, dtype=torch.float64)
+    w      = torch.full((80,), 300.0 / 79.0, dtype=torch.float64)
+    sf     = 20.0
+    lam_ex = 450.0
+    alpha0 = 1.0
+
+    def L_fl(w1, w2, lem1, lem2):
+        a    = torch.exp(-0.5 * ((lam - lam_ex) / sf) ** 2)
+        e1   = torch.exp(-0.5 * ((lam - lem1)   / sf) ** 2)
+        e2   = torch.exp(-0.5 * ((lam - lem2)   / sf) ** 2)
+        e1   = e1 / (e1 * w).sum().clamp(min=1e-30)
+        e2   = e2 / (e2 * w).sum().clamp(min=1e-30)
+        abar = (a * w).sum() * alpha0
+        return w1 * e1 * abar + w2 * e2 * abar
+
+    def jacobian(w1, w2, lem1, lem2):
+        ts   = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                     for v in [w1, w2, lem1, lem2])
+        cols = torch.autograd.functional.jacobian(
+            lambda *a: L_fl(*a), ts, vectorize=True,
+        )
+        return torch.stack([c.detach() for c in cols], dim=1)  # (80, 4)
+
+    # near coincidence: dlam_em = 20nm (1 sigma) -- full rank 4
+    J_near     = jacobian(1.0, 1.0, 530.0, 550.0)
+    col_scales = J_near.norm(dim=0).clamp(min=1e-30)
+    svs_near   = torch.linalg.svdvals(J_near / col_scales)
+    thr        = 1e-6 * svs_near[0].item()
+    rank_near  = int((svs_near > thr).sum().item())
+
+    # exact coincidence: lam_em1 = lam_em2 -- hard rank deficiency
+    # e1 and e2 are computed with identical float64 inputs -> identical outputs
+    # col_w1 = col_w2 exactly -> two SVs = 0.0 exactly
+    J_exact      = jacobian(1.0, 1.0, 540.0, 540.0)
+    svs_exact    = torch.linalg.svdvals(J_exact / col_scales)
+    sigma_min    = svs_exact[-1].item()
+    sigma_2nd    = svs_exact[-2].item()
+
+    return [
+        StructResult(
+            "T11", "rank = 4 at dlam_em = 20nm (1 sigma)",
+            rank_near, 4.0, abs(rank_near - 4) / 4.0, 0.01,
+            rank_near == 4,
+            "svs: " + " ".join(f"{s:.4f}" for s in svs_near.tolist()),
+        ),
+        StructResult(
+            "T11", "sigma_min = 0 exactly at exact coincidence",
+            sigma_min, 0.0, sigma_min, 1e-12,
+            sigma_min < 1e-12,
+            f"svs: {' '.join(f'{s:.2e}' for s in svs_exact.tolist())} -- hard wall",
+        ),
+        StructResult(
+            "T11", "two SVs = 0 (rank drop = 2, not 1)",
+            sigma_2nd, 0.0, sigma_2nd, 1e-12,
+            sigma_2nd < 1e-12,
+            "both w-cols and lam_em-cols collapse (w1=w2 makes them proportional too)",
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -491,8 +553,96 @@ def test_T11() -> StructResult:
 #                 terms compose additively and correctly.
 # ---------------------------------------------------------------------------
 
-def test_T12() -> StructResult:
-    raise NotImplementedError("T12")
+def test_T12() -> list[StructResult]:
+    from src.cauchy_ior import n_cauchy
+    from src.snell_jacobian import tir_jacobian
+    from src.gradient import lambda_star as lam_star_fn, dlambda_star_dA
+
+    # Cauchy glass (n_i) -> vacuum (n_t=1), incidence from the dense side.
+    # A, B chosen so lambda*(A,B) = 420 nm (near lambda_min=400): both TIR and
+    # moving-boundary conditions active simultaneously in a single scene.
+    A_val  = 1.50
+    B_val  = 5000.0
+    kappa  = A_val + B_val / 420.0 ** 2     # n(420) = kappa; sin_i = 1/kappa
+    sin_i  = 1.0 / kappa
+    cos_i  = (1.0 - sin_i ** 2) ** 0.5
+    sin2_i = sin_i ** 2
+
+    lam_min, lam_max = 400.0, 700.0
+    N    = 4000
+    lam  = torch.linspace(lam_min, lam_max, N)
+    dlam = (lam_max - lam_min) / (N - 1)
+
+    # Emission centered at 480 nm, sigma=40 nm.
+    # lambda*=420 is 1.5 sigma below center -> e(lambda*) ~ 0.32 (non-negligible).
+    lam_em, sig_f = 480.0, 40.0
+    e_raw  = torch.exp(-0.5 * ((lam - lam_em) / sig_f) ** 2)
+    norm_e = (e_raw.sum() * dlam)
+    e_n    = e_raw / norm_e
+
+    # I(A) = sum_{lambda_k > lambda*(A)} J_TIR_s(v(lambda_k, A)) * e_n(lambda_k) * dlam
+    def compute_I(A_scalar: float) -> float:
+        A_t  = torch.tensor(A_scalar, dtype=torch.float64)
+        n    = n_cauchy(lam, A_t, B_val)
+        arg  = 1.0 - n ** 2 * sin2_i
+        v    = torch.sqrt(arg.clamp(min=0.0))
+        prop = (arg > 0.0).float()
+        J    = tir_jacobian(v, n,
+                            torch.ones_like(n),
+                            torch.full_like(n, cos_i), 's')
+        return (J * e_n * dlam * prop).sum().item()
+
+    # FD ground truth (h=1e-4; lambda* shifts ~1.5 nm per h, ~20 grid pts)
+    h = 1e-4
+    with torch.no_grad():
+        grad_fd = (compute_I(A_val + h) - compute_I(A_val - h)) / (2.0 * h)
+
+    # Kernel term: autograd on fixed-domain integral (mask frozen at A_val)
+    with torch.no_grad():
+        n0        = n_cauchy(lam, torch.tensor(A_val, dtype=torch.float64), B_val)
+        prop_mask = (1.0 - n0 ** 2 * sin2_i > 0.0).float()
+
+    A_ag  = torch.tensor(A_val, dtype=torch.float64, requires_grad=True)
+    n_ag  = n_cauchy(lam, A_ag, B_val)
+    v_ag  = torch.sqrt((1.0 - n_ag ** 2 * sin2_i).clamp(min=1e-30))
+    J_ag  = tir_jacobian(v_ag, n_ag,
+                         torch.ones(N,  dtype=torch.float64),
+                         torch.full((N,), cos_i, dtype=torch.float64), 's')
+    (J_ag * e_n * dlam * prop_mask).sum().backward()
+    grad_kernel = A_ag.grad.item()
+
+    # Boundary term: -J_TIR_s(v=0, n_i=kappa) * e_n(lambda*) * dlambda*/dA
+    # J_TIR_s(v=0) = 4*kappa (Theorem 3 s-pol limit, verified T5)
+    lam_star_v = float(lam_star_fn(A_val, B_val, cos_i))       # ~420 nm
+    dlam_dA_v  = float(dlambda_star_dA(lam_star_v, B_val))     # lambda*^3 / (2B)
+    J_bdry     = tir_jacobian(
+        torch.zeros(1, dtype=torch.float64),
+        torch.tensor([kappa], dtype=torch.float64),
+        torch.ones(1,  dtype=torch.float64),
+        torch.tensor([cos_i], dtype=torch.float64), 's',
+    ).item()
+    e_at_star    = float(
+        torch.exp(torch.tensor(-0.5 * (lam_star_v - lam_em) ** 2 / sig_f ** 2))
+        / norm_e
+    )
+    grad_boundary = -(J_bdry * e_at_star) * dlam_dA_v
+    grad_analytic = grad_kernel + grad_boundary
+
+    rel_both   = abs(grad_analytic - grad_fd) / (abs(grad_fd) + 1e-30)
+    rel_kernel = abs(grad_kernel   - grad_fd) / (abs(grad_fd) + 1e-30)
+
+    return [
+        StructResult(
+            "T12", "kernel + boundary vs FD",
+            grad_analytic, grad_fd, rel_both, 5e-2, rel_both < 5e-2,
+            f"kernel={grad_kernel:.4g}  boundary={grad_boundary:.4g}  fd={grad_fd:.4g}",
+        ),
+        StructResult(
+            "T12", "kernel alone misses boundary term",
+            grad_kernel, grad_fd, rel_kernel, 0.1, rel_kernel > 0.1,
+            f"kernel-alone is {100.0*rel_kernel:.1f}% wrong; boundary non-negligible",
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
