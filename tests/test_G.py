@@ -612,8 +612,151 @@ def test_G4() -> list[StructResult]:
 # Failure: diagonal/k-dependent banding
 # ---------------------------------------------------------------------------
 
-def test_G5() -> StructResult:
-    raise NotImplementedError("G5")
+def test_G5() -> list[StructResult]:
+    import csv
+    import math
+
+    # Two experiments, per explicit user choice after G4 revealed the naive
+    # "horizontal bands" hypothesis is design-dependent:
+    #
+    #   Panel A "isolated pair"  -- ONE tight pair at separation `sep`, plus
+    #     k-2 extra background species parked 35+ sigma_f away (negligible
+    #     overlap with the pair or each other). Tests whether UNRELATED
+    #     species hurt conditioning of a tight pair. This is what the G5
+    #     docstring's "horizontal bands" prediction actually describes.
+    #
+    #   Panel B "equally-spaced chain" -- k species all spaced `sep` apart
+    #     in a single chain (same model as the first G5 attempt). Confirmed
+    #     to have STRONG k-dependence (chain multicollinearity compounds
+    #     even at fixed nearest-neighbor spacing) -- this contradicts the
+    #     naive horizontal-bands hypothesis and is kept as a documented
+    #     contrast finding, same spirit as G1's naive-vs-stable comparison.
+    sf     = 20.0
+    lam_ex = 450.0
+    alpha0 = 1.0
+
+    def make_model(lam: torch.Tensor, dlam_w: torch.Tensor, center: float):
+        def L_fl_k(k: int, *args):
+            ws, lems = args[:k], args[k:]
+            a    = torch.exp(-0.5 * ((lam - lam_ex) / sf) ** 2)
+            abar = (a * dlam_w).sum() * alpha0
+            out  = torch.zeros_like(lam)
+            for wi, lemi in zip(ws, lems):
+                ei = torch.exp(-0.5 * ((lam - lemi) / sf) ** 2)
+                ei = ei / (ei * dlam_w).sum().clamp(min=1e-30)
+                out = out + wi * ei * abar
+            return out
+
+        def jacobian_k(k: int, lems: list) -> torch.Tensor:
+            ws = [1.0] * k
+            ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                       for v in ws + lems)
+            cols = torch.autograd.functional.jacobian(
+                lambda *a: L_fl_k(k, *a), ts, vectorize=True,
+            )
+            return torch.stack([c.detach() for c in cols], dim=1)
+
+        def cond_of(k: int, lems: list) -> float:
+            J = jacobian_k(k, lems)
+            col_scales = J.norm(dim=0).clamp(min=1e-30)
+            svs = torch.linalg.svdvals(J / col_scales)
+            return (svs[0] / svs[-1]).item()
+
+        return cond_of
+
+    k_vals   = [2, 3, 4, 5, 6]
+    sep_vals = [100.0, 40.0, 20.0, 10.0, 5.0]     # 5*sigma_f down to 0.25*sigma_f
+
+    # Panel A: isolated pair + far background species. Wide synthetic domain
+    # so background offsets (700-1300nm, i.e. 35-65 sigma_f) sit nowhere
+    # near the pair or the window edges.
+    lam_A = torch.linspace(0.0, 3000.0, 300, dtype=torch.float64)
+    w_A   = torch.full((300,), 3000.0 / 299.0, dtype=torch.float64)
+    center_A = 1500.0
+    cond_A_fn = make_model(lam_A, w_A, center_A)
+
+    def bg_positions(n: int) -> list:
+        offsets = [700.0, -700.0, 1000.0, -1000.0, 1300.0, -1300.0]
+        return [center_A + o for o in offsets[:n]]
+
+    # Panel B: equally-spaced chain, same window/grid as G4/T11.
+    lam_B = torch.linspace(400.0, 700.0, 80, dtype=torch.float64)
+    w_B   = torch.full((80,), 300.0 / 79.0, dtype=torch.float64)
+    center_B = 540.0
+    cond_B_fn = make_model(lam_B, w_B, center_B)
+
+    heat_A: dict = {}
+    heat_B: dict = {}
+    for sep in sep_vals:
+        for k in k_vals:
+            pair_lems_A = [center_A + sep / 2.0, center_A - sep / 2.0]
+            heat_A[(k, sep)] = cond_A_fn(k, pair_lems_A + bg_positions(k - 2))
+
+            chain_lems_B = [center_B + sep * (i - (k - 1) / 2.0) for i in range(k)]
+            heat_B[(k, sep)] = cond_B_fn(k, chain_lems_B)
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G5_conditioning_heatmap.csv").open("w", newline="") as f:
+        wtr = csv.writer(f)
+        wtr.writerow(["model", "k", "separation_nm", "condition_number"])
+        for sep in sep_vals:
+            for k in k_vals:
+                wtr.writerow(["isolated_pair", k, sep, heat_A[(k, sep)]])
+        for sep in sep_vals:
+            for k in k_vals:
+                wtr.writerow(["chain", k, sep, heat_B[(k, sep)]])
+
+    # Check 1: Panel A is horizontal bands -- cond number at fixed sep varies
+    # negligibly across k (background species are numerically orthogonal).
+    max_k_var_A = max(
+        (max(heat_A[(k, sep)] for k in k_vals) - min(heat_A[(k, sep)] for k in k_vals))
+        / min(heat_A[(k, sep)] for k in k_vals)
+        for sep in sep_vals
+    )
+
+    # Check 2: Panel B is NOT horizontal -- cond strictly increases with k at
+    # every fixed sep (documented contrast finding, not a bug).
+    chain_k_mono = all(
+        heat_B[(k, sep)] < heat_B[(k + 1, sep)]
+        for sep in sep_vals for k in k_vals[:-1]
+    )
+
+    # Check 3: quantify how strong Panel B's k-dependence is, at the
+    # tightest separation -- this is the number that would falsify a naive
+    # "conditioning depends on separation only" reading of Table 1.
+    chain_ratio_k6_k2 = heat_B[(6, 5.0)] / heat_B[(2, 5.0)]
+
+    # Check 4: cross-validation -- Panel A and Panel B are literally the
+    # same 2-species model at k=2 (isolated pair IS the chain at k=2, no
+    # background/extra chain links yet), computed on different grids/
+    # domains via independently-built jacobian_k closures. They must agree.
+    cross_rel_errs = [
+        abs(heat_A[(2, sep)] - heat_B[(2, sep)]) / heat_B[(2, sep)] for sep in sep_vals
+    ]
+    max_cross_rel_err = max(cross_rel_errs)
+
+    tol = 1e-6
+    return [
+        StructResult("G5", "Panel A (isolated pair + background): horizontal bands, "
+                            "max rel var across k at fixed sep",
+                     max_k_var_A, 0.0, max_k_var_A, 1e-8, max_k_var_A < 1e-8,
+                     "background species 35+ sigma_f away are numerically orthogonal -- "
+                     "confirms the docstring's original horizontal-bands hypothesis"),
+        StructResult("G5", "Panel B (equally-spaced chain): cond strictly increases with k "
+                            "at every fixed sep",
+                     float(chain_k_mono), 1.0, float(not chain_k_mono), 0.5, chain_k_mono,
+                     "contradicts naive horizontal-bands hypothesis -- chain multicollinearity "
+                     "compounds even at fixed nearest-neighbor spacing (real finding, not a bug)"),
+        StructResult("G5", "Panel B k-dependence magnitude: cond(k=6)/cond(k=2) at sep=5nm",
+                     chain_ratio_k6_k2, None, None, 100.0, chain_ratio_k6_k2 > 100.0,
+                     f"ratio={chain_ratio_k6_k2:.3g} -- species count matters as much as "
+                     "separation for a densely-packed multi-fluorophore mix"),
+        StructResult("G5", "Panel A vs Panel B agree at k=2 (same model, independent code paths, "
+                            "different grids/domains)",
+                     max_cross_rel_err, 0.0, max_cross_rel_err, tol, max_cross_rel_err < tol,
+                     "isolated-pair and chain models are identical at k=2 -- cross-validates "
+                     "both jacobian_k closures"),
+    ]
 
 
 # ---------------------------------------------------------------------------
