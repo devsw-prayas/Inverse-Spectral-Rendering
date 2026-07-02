@@ -1010,8 +1010,113 @@ def test_G7() -> list[StructResult]:
 # Failure: smooth, no periodic structure
 # ---------------------------------------------------------------------------
 
-def test_G8() -> StructResult:
-    raise NotImplementedError("G8")
+def test_G8() -> list[StructResult]:
+    import csv
+    import math
+    from src.kernels import fabry_airy_R
+
+    # T7/G8's own doc entry explicitly anticipates BOTH outcomes as valid
+    # ("Smooth, no periodic structure -> near-rational-FSR risk was never
+    # real (useful negative result either way)") -- unlike G5/G7, no need to
+    # check in with the user before writing assertions either way; just
+    # measure it honestly.
+    #
+    # Free-standing thin film, (d,A,B) recovery Jacobian, deliberately sparse
+    # 6-channel wavelength grid (same aliasing-prone setup as G6) so any
+    # FSR/sample-spacing resonance has the best chance of showing up.
+    # d is swept over several FSR periods (defined at the window's center
+    # wavelength) and the resulting condition-number curve is tested for a
+    # dominant single-frequency component locked to the FSR, via a
+    # least-squares single-sinusoid fit at exactly f=1/d_fringe (more
+    # robust than an FFT peak search, which suffers window-leakage smearing
+    # for a signal that isn't perfectly periodic across the sweep).
+    lam    = torch.linspace(450.0, 650.0, 6, dtype=torch.float64)
+    cos_i  = torch.tensor(1.0, dtype=torch.float64)
+    A0, B0 = 1.5, 5000.0
+    lam_c  = 550.0
+    n_ref  = A0 + B0 / lam_c ** 2
+    d_fringe = lam_c / (2.0 * n_ref)      # d-spacing for one full 2*pi phase cycle
+
+    def build_jacobian(d: float) -> torch.Tensor:
+        ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                   for v in [d, A0, B0])
+        cols = torch.autograd.functional.jacobian(
+            lambda dd, A, B: fabry_airy_R(lam, cos_i, dd, A, B, "unpolarized"),
+            ts, vectorize=True,
+        )
+        return torch.stack([c.detach() for c in cols], dim=1)   # (6, 3)
+
+    N = 2048
+    n_periods = 16
+    span = n_periods * d_fringe
+    d0 = 300.0
+    d_sweep = torch.linspace(d0, d0 + span, N, dtype=torch.float64)
+
+    conds = torch.zeros(N, dtype=torch.float64)
+    for i in range(N):
+        J = build_jacobian(d_sweep[i].item())
+        col_scales = J.norm(dim=0).clamp(min=1e-30)
+        svs = torch.linalg.svdvals(J / col_scales)
+        conds[i] = svs[0] / svs[-1]
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G8_fsr_periodicity.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["d_nm", "condition_number"])
+        for i in range(N):
+            w.writerow([d_sweep[i].item(), conds[i].item()])
+
+    # Linear detrend -- separates a slow drift/envelope (which showed up as
+    # the spuriously "dominant" FFT bin in exploration, at the scale of the
+    # whole sweep span) from any genuine fringe-period oscillation.
+    x = torch.linspace(0.0, 1.0, N, dtype=torch.float64)
+    X = torch.stack([torch.ones(N, dtype=torch.float64), x], dim=1)
+    beta  = torch.linalg.lstsq(X, conds.unsqueeze(1)).solution.squeeze()
+    detr  = conds - X @ beta
+    total_var = (detr ** 2).sum().item()
+
+    def r2_at_period(period: float) -> float:
+        theta = 2.0 * math.pi * d_sweep / period
+        Xs = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
+        b  = torch.linalg.lstsq(Xs, detr.unsqueeze(1)).solution.squeeze()
+        ss_res = ((detr - Xs @ b) ** 2).sum().item()
+        return 1.0 - ss_res / total_var
+
+    r2_fundamental = r2_at_period(d_fringe)
+    r2_2nd_harm    = r2_at_period(2.0 * d_fringe)
+    r2_half        = r2_at_period(0.5 * d_fringe)
+
+    # Sanity: the conditioning genuinely varies a lot over the sweep (rules
+    # out a degenerate "nothing happens at all" reading of the negative
+    # result below).
+    cv = (conds.std() / conds.mean()).item()
+
+    tol_periodic = 0.2   # below this, "dominant single-tone periodicity" is not supported
+    return [
+        StructResult("G8", "coefficient of variation of cond(d) over the sweep (sanity: real variation exists)",
+                     cv, None, None, 0.2, cv > 0.2,
+                     f"mean={conds.mean().item():.3g}, std={conds.std().item():.3g} -- "
+                     "conditioning does fluctuate substantially across the sweep"),
+        StructResult("G8", "R^2 of single sinusoid at FSR fundamental (d_fringe) vs detrended cond(d)",
+                     r2_fundamental, 0.0, r2_fundamental, tol_periodic,
+                     r2_fundamental < tol_periodic,
+                     f"d_fringe={d_fringe:.2f}nm explains only {100*r2_fundamental:.1f}% of "
+                     "detrended variance -- NOT a dominant FSR-locked periodicity"),
+        StructResult("G8", "R^2 of single sinusoid at 2nd harmonic (2*d_fringe) vs detrended cond(d)",
+                     r2_2nd_harm, 0.0, r2_2nd_harm, tol_periodic, r2_2nd_harm < tol_periodic,
+                     f"{100*r2_2nd_harm:.1f}% of detrended variance"),
+        StructResult("G8", "R^2 of single sinusoid at half-fringe (0.5*d_fringe) vs detrended cond(d)",
+                     r2_half, 0.0, r2_half, tol_periodic, r2_half < tol_periodic,
+                     f"{100*r2_half:.1f}% of detrended variance -- rules out a x2-aliased lock too"),
+        StructResult("G8", "conclusion: smooth/broadband, no periodic structure synced to FSR",
+                     max(r2_fundamental, r2_2nd_harm, r2_half), 0.0,
+                     max(r2_fundamental, r2_2nd_harm, r2_half), tol_periodic,
+                     max(r2_fundamental, r2_2nd_harm, r2_half) < tol_periodic,
+                     "matches the doc's own anticipated negative-result branch: "
+                     "near-rational-FSR aliasing risk was never a real Jacobian-conditioning "
+                     "concern at this (Python-oracle) level -- doesn't settle V8's separate, "
+                     "render-level sampling-aliasing question"),
+    ]
 
 
 # ---------------------------------------------------------------------------
