@@ -870,8 +870,136 @@ def test_G6() -> list[StructResult]:
 # Failure: stays bounded -> contradicts claimed mechanism
 # ---------------------------------------------------------------------------
 
-def test_G7() -> StructResult:
-    raise NotImplementedError("G7")
+def test_G7() -> list[StructResult]:
+    import csv
+    import math
+    from src.cauchy_ior import n_cauchy, cos_theta_t
+    from src.fresnel import fresnel_rs
+
+    # Extends T6's 3-layer air/film/substrate stack (reused R3_s) with a full
+    # (d,A,B) Jacobian, not just the single ||dR/dd|| column T6 checked.
+    #
+    # Real finding (flagged to and confirmed by user before writing this
+    # test): the G7 docstring's naive "condition number diverges as contrast
+    # -> 0" does NOT hold. ||dR/dd|| (T6's raw sensitivity) does shrink
+    # smoothly and linearly with contrast -- but after column-normalization,
+    # the condition number of the (d,A,B) Jacobian PLATEAUS at a finite value
+    # for every nonzero contrast (even down to 1e-12) and only becomes
+    # singular in the literal contrast=0 limit (hard wall, exact sigma_min=0
+    # -- r23 identically 0 for ALL d, an exact structural degeneracy). This
+    # is the same landmine family as T11/T13/T15: a discontinuous jump at a
+    # single point, not a smooth blowup. Both quantities are reported so the
+    # distinction between "raw sensitivity" and "relative conditioning" is
+    # visible in the same figure.
+    lam   = torch.linspace(400.0, 700.0, 60, dtype=torch.float64)
+    cos_i = torch.ones(60, dtype=torch.float64)
+
+    A_film, B_film, d_film = 1.5, 5000.0, 120.0
+    D_sub = 5000.0   # == B_film -- contrast=0 means substrate == film exactly
+
+    def R3_s(d, A, B, C_sub):
+        n_f   = n_cauchy(lam, A, B)
+        n_s   = n_cauchy(lam, C_sub, D_sub)
+        cos_f = cos_theta_t(cos_i, 1.0, n_f)
+        cos_s = cos_theta_t(cos_f, n_f, n_s)
+        r12   = fresnel_rs(1.0, n_f, cos_i, cos_f)
+        r23   = fresnel_rs(n_f, n_s, cos_f, cos_s)
+        phi   = 4.0 * torch.pi * n_f * cos_f * d / lam
+        eiphi = torch.polar(torch.ones_like(phi), phi)
+        return (r12 + r23 * eiphi).abs() ** 2 / (1.0 + r12 * r23 * eiphi).abs() ** 2
+
+    def build_jacobian(C_sub: float) -> torch.Tensor:
+        ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                   for v in [d_film, A_film, B_film])
+        cols = torch.autograd.functional.jacobian(
+            lambda d, A, B: R3_s(d, A, B, C_sub), ts, vectorize=True,
+        )
+        return torch.stack([c.detach() for c in cols], dim=1)   # (60, 3)
+
+    # Log-spaced contrast sweep, 0.3 down to 1e-10 -- deep enough to confirm
+    # the plateau holds many orders of magnitude below where a real power-law
+    # divergence would already be enormous (cf. G4's cond ~ sep^-3).
+    M = 20
+    contrasts = [0.3 * (1e-10 / 0.3) ** (i / (M - 1)) for i in range(M)]
+
+    d_norms, conds = [], []
+    for c in contrasts:
+        J = build_jacobian(A_film - c)
+        d_norms.append(J[:, 0].norm().item())
+        col_scales = J.norm(dim=0).clamp(min=1e-30)
+        svs = torch.linalg.svdvals(J / col_scales)
+        conds.append((svs[0] / svs[-1]).item())
+
+    # Exact contrast=0: literal hard wall.
+    J0 = build_jacobian(A_film)
+    d_norm_0 = J0[:, 0].norm().item()
+    svs0 = torch.linalg.svdvals(J0 / J0.norm(dim=0).clamp(min=1e-30))
+    sigma_min_0 = svs0[-1].item()
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G7_index_contrast.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["contrast", "dR_dd_norm", "condition_number"])
+        for i in range(M):
+            w.writerow([contrasts[i], d_norms[i], conds[i]])
+        w.writerow([0.0, d_norm_0, "inf"])
+
+    # Check 1: ||dR/dd|| shrinks smoothly, ~linearly with contrast (T6's
+    # quantity, extended over many more decades) -- power-law fit slope ~1.
+    log_c = [math.log(c) for c in contrasts]
+    log_d = [math.log(n) for n in d_norms]
+    n_    = len(log_c)
+    mx, my = sum(log_c) / n_, sum(log_d) / n_
+    num = sum((x - mx) * (y - my) for x, y in zip(log_c, log_d))
+    den = sum((x - mx) ** 2 for x in log_c)
+    slope_d = num / den
+    ss_res = sum((y - (slope_d * x + my - slope_d * mx)) ** 2 for x, y in zip(log_c, log_d))
+    ss_tot = sum((y - my) ** 2 for y in log_d)
+    r2_d = 1.0 - ss_res / ss_tot
+
+    # Check 2: condition number PLATEAUS deep in the small-contrast regime --
+    # NOT across the whole sweep, which does show a real transition between
+    # "moderate contrast" and "deep asymptotic" behavior (cond rises from
+    # 10.7 at contrast=0.3 to ~31 by contrast~1e-3, matching T6's direction).
+    # The claim under test is specifically what happens once you're already
+    # deep in the small-contrast regime: does it keep climbing (divergence)
+    # or flatten out (plateau)? Use the smaller half of the log-spaced sweep
+    # (contrast <~ 5.5e-4) for this check.
+    tail = conds[M // 2:]
+    cond_min, cond_max = min(tail), max(tail)
+    cond_plateau_rel_var = (cond_max - cond_min) / cond_min
+
+    # Check 3: exact hard wall at contrast=0 -- sigma_min = 0 exactly (r23
+    # identically 0 for all d -- structural rank deficiency, not asymptotic).
+    # Meanwhile ||dR/dd|| at exact contrast=0 is also exactly 0 (consistent
+    # with the smooth trend in Check 1 extrapolated to its endpoint).
+    tol_wall = 1e-12
+
+    # Check 4: quantitative separation between the two notions -- ||dR/dd||
+    # changes by many orders of magnitude across the sweep while cond changes
+    # by only a small fraction, over the SAME contrast range.
+    d_norm_ratio = d_norms[0] / d_norms[-1]
+
+    tol = 1e-2
+    return [
+        StructResult("G7", "||dR/dd|| ~ contrast^1 (smooth, log-log R^2)",
+                     r2_d, 1.0, abs(r2_d - 1.0), tol, abs(r2_d - 1.0) < tol,
+                     f"slope={slope_d:.4f} -- raw sensitivity shrinks linearly with contrast, T6 extended"),
+        StructResult("G7", "condition number PLATEAUS (does not diverge) deep in small-contrast regime",
+                     cond_plateau_rel_var, 0.0, cond_plateau_rel_var, 0.05,
+                     cond_plateau_rel_var < 0.05,
+                     f"cond range [{cond_min:.3f}, {cond_max:.3f}] over contrast in "
+                     f"[{contrasts[-1]:.1e}, {contrasts[M // 2]:.1e}] -- contradicts naive "
+                     "divergence hypothesis, confirmed with user before asserting this"),
+        StructResult("G7", "exact hard wall: sigma_min = 0 at contrast = 0 exactly",
+                     sigma_min_0, 0.0, sigma_min_0, tol_wall, sigma_min_0 < tol_wall,
+                     "r23 identically 0 for ALL d at exact contrast=0 -- structural, not asymptotic"),
+        StructResult("G7", "raw sensitivity spans many decades while conditioning barely moves",
+                     d_norm_ratio, None, None, 1e6, d_norm_ratio > 1e6,
+                     f"||dR/dd|| ratio={d_norm_ratio:.3g} across the sweep vs cond varying "
+                     f"only {100*cond_plateau_rel_var:.2f}% -- 'unobservable in absolute "
+                     "sensitivity' != 'ill-conditioned in relative terms'"),
+    ]
 
 
 # ---------------------------------------------------------------------------
