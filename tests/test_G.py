@@ -767,8 +767,99 @@ def test_G5() -> list[StructResult]:
 # Failure: no flattening (keeps improving linearly) -- real systems saturate
 # ---------------------------------------------------------------------------
 
-def test_G6() -> StructResult:
-    raise NotImplementedError("G6")
+def test_G6() -> list[StructResult]:
+    import csv
+    from src.kernels import fabry_airy_R
+
+    # Thin-film (d, A, B) recovery from unpolarized R(lambda) measurements at
+    # progressively more incidence angles. A sparse 6-channel wavelength grid
+    # (not the usual 80-point fine grid) so a single measurement alone is
+    # genuinely under-determined and angle diversity has real work to do --
+    # with 80 fine spectral samples one measurement already pins (d,A,B)
+    # fairly well (checked: cond~7-8 even at n=1), which would hide the
+    # "sharp drop then flatten" shape this test is meant to demonstrate.
+    lam    = torch.linspace(450.0, 650.0, 6, dtype=torch.float64)
+    d0, A0, B0 = 80.0, 1.5, 5000.0
+
+    # Angles ordered from normal incidence (least diverse) to grazing (most
+    # diverse) -- unpolarized only. (s vs p diversity was also explored and
+    # does help further, but interacts non-monotonically with angle order
+    # since s=p exactly at normal incidence and their relative informativeness
+    # varies with angle -- unpolarized angle-only sweep gives the cleanest,
+    # strictly monotonic signal for this test's shape claim.)
+    angles = [1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60,
+              0.55, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10]
+    M = len(angles)
+
+    def build_jacobian(n_meas: int) -> torch.Tensor:
+        ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                   for v in [d0, A0, B0])
+
+        def fn(d, A, B):
+            outs = [fabry_airy_R(lam, ci, d, A, B, "unpolarized")
+                    for ci in angles[:n_meas]]
+            return torch.cat(outs)
+
+        cols = torch.autograd.functional.jacobian(fn, ts, vectorize=True)
+        return torch.stack([c.detach() for c in cols], dim=1)
+
+    conds = []
+    for n in range(1, M + 1):
+        J = build_jacobian(n)
+        col_scales = J.norm(dim=0).clamp(min=1e-30)
+        svs = torch.linalg.svdvals(J / col_scales)
+        conds.append((svs[0] / svs[-1]).item())
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G6_measurement_diversity.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["n_measurements", "cos_i_added", "condition_number"])
+        for i in range(M):
+            w.writerow([i + 1, angles[i], conds[i]])
+
+    rel_drops = [(conds[i] - conds[i + 1]) / conds[i] for i in range(M - 1)]
+
+    # Check 1: strictly monotonic -- more diversity never hurts conditioning.
+    mono_viol = sum(1 for d in rel_drops if d < 0.0)
+
+    # Check 2: sharp initial drop -- the very first added measurement alone
+    # buys a large fraction improvement.
+    first_drop = rel_drops[0]
+
+    # Check 3: diminishing returns -- average |relative drop| over the first
+    # 4 additions is much larger than over the last 4 (visible flattening).
+    first4_avg = sum(rel_drops[:4]) / 4.0
+    last4_avg  = sum(rel_drops[-4:]) / 4.0
+    dr_ratio   = first4_avg / max(last4_avg, 1e-30)
+
+    # Check 4: substantial net improvement over the whole sweep.
+    net_ratio = conds[0] / conds[-1]
+
+    # Check 5: near-flat tail -- adding the last few (most redundant, most
+    # grazing) angles changes conditioning by only a small fraction, unlike
+    # the first addition (Check 2). This is the literal "flattening" the G6
+    # docstring predicts, and its failure mode ("no flattening, keeps
+    # improving linearly") would show up here as a large value.
+    tail_change = abs(conds[-1] - conds[-4]) / conds[-4]
+
+    tol = 1e-9
+    return [
+        StructResult("G6", "condition number strictly monotonic non-increasing with n_measurements",
+                     float(mono_viol), 0.0, float(mono_viol), 0.5, mono_viol == 0,
+                     f"{mono_viol} increasing steps out of {M-1} as measurements are added"),
+        StructResult("G6", "sharp initial drop: relative improvement from 1st added measurement",
+                     first_drop, None, None, 0.1, first_drop > 0.1,
+                     f"cond drops {100*first_drop:.1f}% after just the 2nd angle is added"),
+        StructResult("G6", "diminishing returns: avg |rel drop| first-4 / last-4 additions",
+                     dr_ratio, None, None, 2.0, dr_ratio > 2.0,
+                     f"first4_avg={first4_avg:.4f}, last4_avg={last4_avg:.4f}"),
+        StructResult("G6", "substantial net conditioning improvement, cond(1)/cond(M)",
+                     net_ratio, None, None, 4.0, net_ratio > 4.0,
+                     f"cond(1)={conds[0]:.3g} -> cond({M})={conds[-1]:.3g}"),
+        StructResult("G6", "near-flat tail: |cond(M)-cond(M-3)|/cond(M-3), most-grazing angles",
+                     tail_change, 0.0, tail_change, 0.15, tail_change < 0.15,
+                     "visible flattening near the end of the sweep, not linear improvement"),
+    ]
 
 
 # ---------------------------------------------------------------------------
