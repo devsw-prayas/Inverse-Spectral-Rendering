@@ -279,8 +279,187 @@ def test_G2() -> list[StructResult]:
 # Failure: jump/kink at lambda*=lambda_min or lambda_max
 # ---------------------------------------------------------------------------
 
-def test_G3() -> StructResult:
-    raise NotImplementedError("G3")
+def test_G3() -> list[StructResult]:
+    import csv
+    from src.cauchy_ior import n_cauchy
+    from src.snell_jacobian import tir_jacobian
+    from src.gradient import lambda_star as lam_star_fn, dlambda_star_dA
+
+    # Same TIR-in-glass setup as T12 (fixed cos_i via kappa=1/sin_i, Cauchy
+    # glass -> vacuum), but here A is swept across a *wide* range so that
+    # lambda*(A) crosses continuously through and past both window edges.
+    # Design principle (see running_notes / memory): unlike T12 -- which
+    # deliberately parked lambda* only 1.5 sigma from lambda_min to prove the
+    # boundary term matters -- here the emission is centered in the window
+    # with sigma small enough that e_n is negligible (~7.5 sigma) at BOTH
+    # edges. That makes the moving-boundary term itself vanish smoothly as
+    # lambda* approaches lambda_min/lambda_max, so gluing it to the "outside
+    # window -> exactly 0" branch produces no visible kink.
+    kappa  = 1.55                         # 1/sin_i, fixed incidence geometry
+    sin_i  = 1.0 / kappa
+    cos_i  = (1.0 - sin_i ** 2) ** 0.5
+    sin2_i = sin_i ** 2
+    B_val  = 8000.0
+
+    lam_min, lam_max = 400.0, 700.0
+    N    = 4000
+    lam  = torch.linspace(lam_min, lam_max, N)
+    dlam = (lam_max - lam_min) / (N - 1)
+
+    lam_em, sig_f = 550.0, 20.0           # window center; 150nm/20nm = 7.5 sigma to either edge
+    e_raw  = torch.exp(-0.5 * ((lam - lam_em) / sig_f) ** 2)
+    norm_e = e_raw.sum() * dlam
+    e_n    = e_raw / norm_e
+
+    def e_n_at(lmb: float) -> float:
+        return float(torch.exp(torch.tensor(-0.5 * (lmb - lam_em) ** 2 / sig_f ** 2)) / norm_e)
+
+    def compute_I(A_scalar: float) -> float:
+        A_t  = torch.tensor(A_scalar, dtype=torch.float64)
+        n    = n_cauchy(lam, A_t, B_val)
+        arg  = 1.0 - n ** 2 * sin2_i
+        v    = torch.sqrt(arg.clamp(min=0.0))
+        prop = (arg > 0.0).float()
+        J    = tir_jacobian(v, n, torch.ones_like(n), torch.full_like(n, cos_i), 's')
+        return (J * e_n * dlam * prop).sum().item()
+
+    # Boundary-term J factor: at lambda=lambda*(A), v=0 by definition (that's
+    # the critical condition n(lambda*)=kappa), so J_TIR(v=0) = 4*kappa is
+    # the SAME constant for every A in the sweep -- lambda* moves, but it
+    # always moves along the v=0 contour. Full Leibniz boundary term is
+    # -J(v=0)*e_n(lambda*)*dlambda*/dA, not just -e_n(lambda*)*dlambda*/dA
+    # (that simpler form is only correct for a bare emission integrand with
+    # no J factor, cf. T12 which also multiplies by J_bdry explicitly).
+    J_bdry = float(tir_jacobian(
+        torch.zeros(1, dtype=torch.float64), torch.tensor([kappa], dtype=torch.float64),
+        torch.ones(1, dtype=torch.float64), torch.tensor([cos_i], dtype=torch.float64), 's'))
+
+    # Sweep lambda*(A) targets from well below lambda_min to well above
+    # lambda_max (50nm margin on each side of the window), inverting
+    # lambda*(A,B,cos_i) = sqrt(B/(kappa-A)) for A given a target lambda*.
+    M = 121
+    lam_star_target = torch.linspace(350.0, 750.0, M)
+    A_sweep = kappa - B_val / lam_star_target ** 2
+
+    A_vals, lam_stars, I_vals = [], [], []
+    grad_fd, grad_kernel, grad_boundary, grad_total = [], [], [], []
+
+    for i in range(M):
+        A_val = A_sweep[i].item()
+
+        lam_star_i = float(lam_star_fn(A_val, B_val, cos_i))
+        dlam_dA_i  = float(dlambda_star_dA(lam_star_i, B_val))
+
+        # Adaptive FD step: size h so the induced lambda* shift spans ~60
+        # grid cells, regardless of how sensitive lambda*(A) is at this point
+        # (dlambda*/dA ~ lambda*^3, spans orders of magnitude over the
+        # sweep). The propagating mask is a hard per-grid-point cutoff, so
+        # I(A) is a staircase at sub-grid-cell scale -- FD must average over
+        # enough grid crossings to see the smooth macroscopic slope (same
+        # discretization-bias mechanism as T12, just needing a wider window
+        # here since dlambda*/dA is much larger).
+        h = 60.0 * dlam / max(abs(dlam_dA_i), 1e-30)
+        grad_fd_i = (compute_I(A_val + h) - compute_I(A_val - h)) / (2.0 * h)
+
+        # Kernel term: autograd holding the propagating mask fixed at A_val.
+        with torch.no_grad():
+            n0        = n_cauchy(lam, torch.tensor(A_val, dtype=torch.float64), B_val)
+            prop_mask = (1.0 - n0 ** 2 * sin2_i > 0.0).float()
+        A_ag = torch.tensor(A_val, dtype=torch.float64, requires_grad=True)
+        n_ag = n_cauchy(lam, A_ag, B_val)
+        v_ag = torch.sqrt((1.0 - n_ag ** 2 * sin2_i).clamp(min=1e-30))
+        J_ag = tir_jacobian(v_ag, n_ag, torch.ones(N, dtype=torch.float64),
+                             torch.full((N,), cos_i, dtype=torch.float64), 's')
+        (J_ag * e_n * dlam * prop_mask).sum().backward()
+        grad_kernel_i = A_ag.grad.item()
+
+        # Boundary term: -J_bdry * e_n(lambda*) * dlambda*/dA, active only
+        # while lambda* is actually inside the measurement window.
+        if lam_min <= lam_star_i <= lam_max:
+            grad_boundary_i = -(J_bdry * e_n_at(lam_star_i)) * dlam_dA_i
+        else:
+            grad_boundary_i = 0.0
+
+        A_vals.append(A_val)
+        lam_stars.append(lam_star_i)
+        I_vals.append(compute_I(A_val))
+        grad_fd.append(grad_fd_i)
+        grad_kernel.append(grad_kernel_i)
+        grad_boundary.append(grad_boundary_i)
+        grad_total.append(grad_kernel_i + grad_boundary_i)
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G3_moving_boundary_sweep.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["A", "lambda_star", "I", "grad_fd", "grad_kernel", "grad_boundary", "grad_total"])
+        for i in range(M):
+            w.writerow([A_vals[i], lam_stars[i], I_vals[i], grad_fd[i],
+                        grad_kernel[i], grad_boundary[i], grad_total[i]])
+
+    lam_stars_t = torch.tensor(lam_stars)
+    grad_fd_t    = torch.tensor(grad_fd)
+    grad_total_t = torch.tensor(grad_total)
+    grad_bdry_t  = torch.tensor(grad_boundary)
+
+    # Check 1: lambda*(A_sweep) reproduces the target sweep exactly (sanity
+    # on the closed-form inversion) and is monotonic increasing throughout.
+    max_rel_target = ((lam_stars_t - lam_star_target).abs() / lam_star_target).max().item()
+    mono_viol = (torch.diff(lam_stars_t) <= 0.0).sum().item()
+
+    # Check 2: boundary term is negligible at both window edges (design
+    # principle: e_n is ~7.5 sigma out) -- confirms the "no kink" regime,
+    # in contrast to T12's deliberately non-negligible e_at_star=0.32.
+    idx_near_min = min(range(M), key=lambda i: abs(lam_stars[i] - lam_min))
+    idx_near_max = min(range(M), key=lambda i: abs(lam_stars[i] - lam_max))
+    bdry_scale = grad_bdry_t.abs().max().item() + 1e-30
+    bdry_at_min_rel = abs(grad_boundary[idx_near_min]) / bdry_scale
+    bdry_at_max_rel = abs(grad_boundary[idx_near_max]) / bdry_scale
+
+    # Check 3: kernel+boundary (= predicted total) tracks FD closely across
+    # the whole sweep. Scale-normalized absolute error (not a raw per-point
+    # relative error): grad_fd crosses zero partway through the sweep (the
+    # curve isn't monotonic), and a plain relative metric blows up near that
+    # crossing even though the absolute mismatch there is tiny relative to
+    # the sweep's overall dynamic range.
+    scale = grad_fd_t.abs().max().item()
+    max_rel_err = ((grad_total_t - grad_fd_t).abs() / scale).max().item()
+
+    # Check 4: no kink in the true (FD) gradient at either edge crossing --
+    # the local second difference of grad_fd at the two crossing indices
+    # must not be anomalously larger than the typical second difference
+    # elsewhere in the sweep (interior points, away from either edge).
+    d2 = grad_fd_t[2:] - 2.0 * grad_fd_t[1:-1] + grad_fd_t[:-2]
+    interior = torch.cat([d2[:max(idx_near_min - 5, 1)], d2[min(idx_near_max + 5, M - 2):]])
+    typical_d2 = interior.abs().median().item() + 1e-30
+    kink_min = abs(d2[max(idx_near_min - 1, 0)].item()) / typical_d2
+    kink_max = abs(d2[max(idx_near_max - 1, 0)].item()) / typical_d2
+
+    tol = 1e-6
+    return [
+        StructResult("G3", "lambda*(A_sweep) matches inverted target",
+                     max_rel_target, 0.0, max_rel_target, tol, max_rel_target < tol,
+                     "closed-form A = kappa - B/lambda*^2 inverts lambda_star() exactly"),
+        StructResult("G3", "lambda*(A) strictly monotonic increasing over full sweep",
+                     float(mono_viol), 0.0, float(mono_viol), 0.5, mono_viol == 0,
+                     f"{mono_viol} non-increasing steps out of {M-1}"),
+        StructResult("G3", "boundary term negligible at lambda*~lambda_min crossing",
+                     bdry_at_min_rel, 0.0, bdry_at_min_rel, 1e-2, bdry_at_min_rel < 1e-2,
+                     f"e_n(lambda_min)~{e_n_at(lam_min):.2e} (design: ~7.5 sigma out), "
+                     "cf. T12's deliberately non-negligible e_at_star=0.32"),
+        StructResult("G3", "boundary term negligible at lambda*~lambda_max crossing",
+                     bdry_at_max_rel, 0.0, bdry_at_max_rel, 1e-2, bdry_at_max_rel < 1e-2,
+                     f"e_n(lambda_max)~{e_n_at(lam_max):.2e} (design: ~7.5 sigma out)"),
+        StructResult("G3", "kernel+boundary vs FD, max |error|/scale over full sweep",
+                     max_rel_err, 0.0, max_rel_err, 2e-2, max_rel_err < 2e-2,
+                     f"scale = max|grad_fd| = {scale:.3g}; residual is grid discretization "
+                     "bias near lambda*~lam_em, same mechanism as T12's 5e-2"),
+        StructResult("G3", "no kink in true dI/dA at lambda*=lambda_min crossing",
+                     kink_min, 1.0, abs(kink_min - 1.0), 5.0, kink_min < 5.0,
+                     f"|2nd diff at crossing| / |typical interior 2nd diff| = {kink_min:.2f}"),
+        StructResult("G3", "no kink in true dI/dA at lambda*=lambda_max crossing",
+                     kink_max, 1.0, abs(kink_max - 1.0), 5.0, kink_max < 5.0,
+                     f"|2nd diff at crossing| / |typical interior 2nd diff| = {kink_max:.2f}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
