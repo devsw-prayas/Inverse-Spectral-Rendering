@@ -471,8 +471,136 @@ def test_G3() -> list[StructResult]:
 # Failure: plateau instead of divergence -> "exact degeneracy" claim wrong
 # ---------------------------------------------------------------------------
 
-def test_G4() -> StructResult:
-    raise NotImplementedError("G4")
+def test_G4() -> list[StructResult]:
+    import csv
+    import math
+
+    # Same 2-fluorophore model as T11 (w1, w2, lam_em1, lam_em2 parameters,
+    # w1=w2=1.0 held fixed, only the emission-peak separation sep is swept).
+    # T11 showed sigma_min=0 EXACTLY at sep=0 (hard wall, two SVs collapse
+    # simultaneously since w1=w2 makes the w-columns proportional too, once
+    # lem1=lem2 makes the lam_em-columns proportional). G4 sweeps sep on a
+    # log grid from 5*sigma_f down to near that wall and checks the
+    # divergence is a genuine smooth power law all the way down, not a
+    # plateau that would contradict T11's "hard wall, not just large cond"
+    # framing.
+    lam    = torch.linspace(400.0, 700.0, 80, dtype=torch.float64)
+    w      = torch.full((80,), 300.0 / 79.0, dtype=torch.float64)
+    sf     = 20.0
+    lam_ex = 450.0
+    alpha0 = 1.0
+    center = 540.0                        # same reference point as T11
+
+    def L_fl(w1, w2, lem1, lem2):
+        a  = torch.exp(-0.5 * ((lam - lam_ex) / sf) ** 2)
+        e1 = torch.exp(-0.5 * ((lam - lem1)   / sf) ** 2)
+        e2 = torch.exp(-0.5 * ((lam - lem2)   / sf) ** 2)
+        e1 = e1 / (e1 * w).sum().clamp(min=1e-30)
+        e2 = e2 / (e2 * w).sum().clamp(min=1e-30)
+        abar = (a * w).sum() * alpha0
+        return w1 * e1 * abar + w2 * e2 * abar
+
+    def jacobian(w1, w2, lem1, lem2):
+        ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                   for v in [w1, w2, lem1, lem2])
+        cols = torch.autograd.functional.jacobian(
+            lambda *a: L_fl(*a), ts, vectorize=True,
+        )
+        return torch.stack([c.detach() for c in cols], dim=1)   # (80, 4)
+
+    # sep: 5*sigma_f (well-separated) down to 0.01nm (near coincidence, but
+    # kept far enough above the SVD noise floor -- cond ~2e11 there, still
+    # well inside float64's reliable range, cf. T11's exact-zero hard wall
+    # at sep=0 exactly).
+    M = 60
+    sep = torch.tensor([100.0 * (0.01 / 100.0) ** (i / (M - 1)) for i in range(M)],
+                        dtype=torch.float64)
+
+    conds, sigma_mins, sigma_maxs = [], [], []
+    for i in range(M):
+        s = sep[i].item()
+        J = jacobian(1.0, 1.0, center + s / 2.0, center - s / 2.0)
+        col_scales = J.norm(dim=0).clamp(min=1e-30)
+        svs = torch.linalg.svdvals(J / col_scales)
+        sigma_maxs.append(svs[0].item())
+        sigma_mins.append(svs[-1].item())
+        conds.append((svs[0] / svs[-1]).item())
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G4_multi_fluorophore_conditioning.csv").open("w", newline="") as f:
+        wtr = csv.writer(f)
+        wtr.writerow(["separation_nm", "sigma_max", "sigma_min", "condition_number"])
+        for i in range(M):
+            wtr.writerow([sep[i].item(), sigma_maxs[i], sigma_mins[i], conds[i]])
+
+    log_sep  = [math.log(s) for s in sep.tolist()]
+    log_cond = [math.log(c) for c in conds]
+
+    # Check 1: monotonic blowup as sep -> 0, no plateau anywhere in the sweep.
+    mono_viol = sum(1 for i in range(M - 1) if conds[i] >= conds[i + 1])
+
+    # Check 2: well-conditioned at the well-separated end (sep = 5*sigma_f)
+    # -- sanity anchor, mirrors T9/T11's "normal point" check.
+    cond_wide = conds[0]
+
+    # Check 3: power-law fit log(cond) = -p*log(sep) + c over the smaller
+    # half of the sweep (deep in the asymptotic regime) -- "identify the
+    # functional form of divergence" per the G4 spec. Least squares by hand
+    # (no numpy per repo convention).
+    xs, ys = log_sep[M // 2:], log_cond[M // 2:]
+    n  = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = sum((x - mx) ** 2 for x in xs)
+    slope = num / den
+    intercept = my - slope * mx
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1.0 - ss_res / ss_tot
+
+    # Check 4: self-consistency of the power law -- fit separately on the
+    # first and second quarters of the asymptotic half; slopes must agree
+    # (a genuine power law is straight in log-log space at every scale; an
+    # exponential-type divergence or a plateau would bend and disagree).
+    def fit_slope(xs_: list, ys_: list) -> float:
+        n_ = len(xs_)
+        mx_ = sum(xs_) / n_
+        my_ = sum(ys_) / n_
+        num_ = sum((x - mx_) * (y - my_) for x, y in zip(xs_, ys_))
+        den_ = sum((x - mx_) ** 2 for x in xs_)
+        return num_ / den_
+
+    q = M // 4
+    slope_q1 = fit_slope(log_sep[2 * q:3 * q], log_cond[2 * q:3 * q])
+    slope_q2 = fit_slope(log_sep[3 * q:4 * q], log_cond[3 * q:4 * q])
+    slope_diff = abs(slope_q1 - slope_q2)
+
+    # Check 5: no plateau -- cond at the smallest sep is orders of magnitude
+    # above cond one decade-in-sep earlier (explicit anti-plateau guard,
+    # matching the G4 docstring's stated failure mode).
+    idx_decade = min(range(M), key=lambda i: abs(sep[i].item() - sep[-1].item() * 10.0))
+    plateau_ratio = conds[-1] / max(conds[idx_decade], 1e-30)
+
+    tol = 1e-2
+    return [
+        StructResult("G4", "condition number monotonic blowup, no plateau",
+                     float(mono_viol), 0.0, float(mono_viol), 0.5, mono_viol == 0,
+                     f"{mono_viol} non-increasing steps out of {M-1} as sep -> 0"),
+        StructResult("G4", "well-conditioned at sep = 5*sigma_f",
+                     cond_wide, 1.0, abs(cond_wide - 1.0), 0.1, cond_wide < 1.1,
+                     f"cond={cond_wide:.4f} at widest separation, sanity anchor"),
+        StructResult("G4", "power-law fit quality (log-log R^2), smaller half of sweep",
+                     r2, 1.0, abs(r2 - 1.0), tol, abs(r2 - 1.0) < tol,
+                     f"slope={slope:.4f} -- cond ~ separation^{slope:.2f}"),
+        StructResult("G4", "power-law slope self-consistent across sub-ranges",
+                     slope_diff, 0.0, slope_diff, 0.05, slope_diff < 0.05,
+                     f"slope(q1)={slope_q1:.4f}, slope(q2)={slope_q2:.4f} -- "
+                     "straight in log-log at every scale, not curving"),
+        StructResult("G4", "no plateau: cond(sep_min) >> cond(10x sep_min)",
+                     plateau_ratio, None, None, 100.0, plateau_ratio > 100.0,
+                     f"ratio={plateau_ratio:.3g} (cond ~ sep^-3 predicts ~1000x per decade)"),
+    ]
 
 
 # ---------------------------------------------------------------------------
