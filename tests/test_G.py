@@ -1127,8 +1127,116 @@ def test_G8() -> list[StructResult]:
 # Failure: discontinuity at k=0
 # ---------------------------------------------------------------------------
 
-def test_G9() -> StructResult:
-    raise NotImplementedError("G9")
+def test_G9() -> list[StructResult]:
+    import csv
+    import math
+
+    # sec9's Lemma B contrast case (already verified analytically by sympy,
+    # "verified by contrast"): under a linear-ramp illuminant L_i(lam')=L0+k*lam',
+    # absorbed power = sqrt(2*pi)*alpha0*sigma_f*(L0 + k*lam_ex), so
+    # d(absorbed power)/d(lam_ex) = sqrt(2*pi)*alpha0*sigma_f*k exactly -- a
+    # perfectly straight line through the origin in k. G9 promotes this from
+    # a single point (T8) to a continuous sweep through k=0 (including
+    # negative k, not just "0->up") specifically to test for the docstring's
+    # named failure mode: a discontinuity/kink right at k=0 that would mean
+    # Lemma B's flat-illuminant boundary is a measure-zero technicality
+    # rather than a real regime change.
+    #
+    # lam_ex is centered in-window, sigma_f small enough that truncation is
+    # negligible (T14 lesson: this integral is only exact over ALL lambda';
+    # the renderer integrates over [lam_min,lam_max] only -- centering
+    # lam_ex with many sigma of margin avoids that separate, already-
+    # documented truncation effect from contaminating this test).
+    lam_min, lam_max = 400.0, 700.0
+    N = 300
+    lam  = torch.linspace(lam_min, lam_max, N, dtype=torch.float64)
+    dlam = (lam_max - lam_min) / (N - 1)
+    w    = torch.full((N,), dlam, dtype=torch.float64)
+
+    alpha0, sigma_f, L0 = 1.0, 20.0, 1.0
+    lam_ex_val = 550.0   # window center, 7.5 sigma_f from either edge
+
+    def absorbed_power(lam_ex_t: torch.Tensor, k: float) -> torch.Tensor:
+        L_i = L0 + k * lam
+        a   = alpha0 * torch.exp(-0.5 * ((lam - lam_ex_t) / sigma_f) ** 2)
+        return (L_i * a * w).sum()
+
+    M = 21
+    k_vals = [-0.02 + 0.07 * i / (M - 1) for i in range(M)]   # -0.02 .. 0.05, includes 0 exactly
+    k_vals[(M - 1) // 2] = 0.0
+
+    autograds, analytics, fds = [], [], []
+    for k in k_vals:
+        lam_ex_t = torch.tensor(lam_ex_val, dtype=torch.float64, requires_grad=True)
+        absorbed_power(lam_ex_t, k).backward()
+        autograds.append(lam_ex_t.grad.item())
+
+        analytics.append(alpha0 * math.sqrt(2.0 * math.pi) * sigma_f * k)
+
+        h = 1e-3
+        with torch.no_grad():
+            fp = absorbed_power(torch.tensor(lam_ex_val + h, dtype=torch.float64), k)
+            fm = absorbed_power(torch.tensor(lam_ex_val - h, dtype=torch.float64), k)
+        fds.append(((fp - fm) / (2.0 * h)).item())
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G9_illuminant_slope.csv").open("w", newline="") as f:
+        wtr = csv.writer(f)
+        wtr.writerow(["k", "autograd", "analytic", "fd"])
+        for i in range(M):
+            wtr.writerow([k_vals[i], autograds[i], analytics[i], fds[i]])
+
+    zero_idx = (M - 1) // 2
+    scale = max(abs(a) for a in analytics)
+
+    # Check 1: exactly 0 at k=0, all three ways.
+    ag0, an0, fd0 = autograds[zero_idx], analytics[zero_idx], fds[zero_idx]
+
+    # Check 2: autograd matches the closed-form analytic slope across the
+    # whole sweep (scale-normalized, since values pass through exactly 0).
+    max_ag_an_err = max(abs(a - b) for a, b in zip(autograds, analytics)) / scale
+
+    # Check 3: three-way oracle -- autograd vs central FD (per CLAUDE.md
+    # convention), same scale normalization.
+    max_ag_fd_err = max(abs(a - b) for a, b in zip(autograds, fds)) / scale
+
+    # Check 4: no kink at k=0 -- independently fit a line through the
+    # negative-k half and the positive-k half (excluding k=0 itself) and
+    # confirm the slopes agree (single straight line, not two different
+    # ones meeting at a corner).
+    def fit_slope(ks: list, ys: list) -> float:
+        n = len(ks)
+        mx, my = sum(ks) / n, sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(ks, ys))
+        den = sum((x - mx) ** 2 for x in ks)
+        return num / den
+
+    neg_k = k_vals[:zero_idx]
+    neg_y = autograds[:zero_idx]
+    pos_k = k_vals[zero_idx + 1:]
+    pos_y = autograds[zero_idx + 1:]
+    slope_neg = fit_slope(neg_k, neg_y)
+    slope_pos = fit_slope(pos_k, pos_y)
+    slope_expected = alpha0 * math.sqrt(2.0 * math.pi) * sigma_f
+    kink = abs(slope_neg - slope_pos) / slope_expected
+
+    tol = 1e-6
+    return [
+        StructResult("G9", "d(absorbed power)/d(lam_ex) = 0 exactly at k=0 -- autograd",
+                     ag0, 0.0, abs(ag0), 1e-9, abs(ag0) < 1e-9, "flat illuminant, Lemma B"),
+        StructResult("G9", "d(absorbed power)/d(lam_ex) = 0 exactly at k=0 -- FD",
+                     fd0, 0.0, abs(fd0), 1e-6, abs(fd0) < 1e-6, "flat illuminant, Lemma B"),
+        StructResult("G9", "autograd matches closed-form analytic slope across full k sweep",
+                     max_ag_an_err, 0.0, max_ag_an_err, tol, max_ag_an_err < tol,
+                     f"scale-normalized max|autograd-analytic|, slope={slope_expected:.4f} per unit k"),
+        StructResult("G9", "autograd matches central FD across full k sweep (3-way oracle)",
+                     max_ag_fd_err, 0.0, max_ag_fd_err, 1e-4, max_ag_fd_err < 1e-4,
+                     "scale-normalized max|autograd-FD|"),
+        StructResult("G9", "no kink at k=0: slope(k<0) matches slope(k>0)",
+                     kink, 0.0, kink, tol, kink < tol,
+                     f"slope_neg={slope_neg:.4f}, slope_pos={slope_pos:.4f}, "
+                     "expected both = sqrt(2*pi)*alpha0*sigma_f -- single straight line through k=0"),
+    ]
 
 
 # ---------------------------------------------------------------------------
