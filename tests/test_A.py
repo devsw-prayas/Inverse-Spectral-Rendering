@@ -11,7 +11,7 @@ Run:
 
 Tests
 -----
-A1   Airy R in [0,1]              -- symbolic non-negativity of (T+R-1) residual
+A1   Airy R in [0,1]              -- symbolic denom-numer=(1-r1^2)(1-r2^2), delta-independent
 A2   dR/dd at d->0                -- symbolic limit must vanish or match bare-Fresnel
 A3   ||K_x|| equality case        -- Cauchy-Schwarz equality at f = a/||a||
 A4   K_x* adjoint degenerate      -- T*=T exactly when e=a; bug iff e != a
@@ -38,11 +38,98 @@ from tests.harness import Reporter, StructResult, OpenTheoreticalQuestion
 # A1: Airy R in [0,1]
 # Claim (ss1): R(lambda;d,A,B) in [0,1] for all phase delta, |r1|,|r2| < 1.
 # Symbolic: (1+r1^2*r2^2+2*r1*r2*cos_d) - (r1^2+r2^2+2*r1*r2*cos_d)
-#           = (1-r1^2)(1-r2^2) >= 0, independent of delta.
+#           = (1-r1^2)(1-r2^2), independent of delta.
+#
+# Note on running_notes' table entry: it writes the residual as
+# "(1-r1^2)(1-r2^2)(1-cos(delta))", but sympy confirms the cos(delta) terms
+# cancel EXACTLY between numerator and denominator -- the true residual has
+# zero delta-dependence (d/d(delta) of the residual is symbolically 0). The
+# "(1-cos delta)" factor in the notes appears to be a transcription slip;
+# flagging here rather than silently coding around it, same discipline as
+# G-series's docstring-vs-reality checks.
 # ---------------------------------------------------------------------------
 
-def test_A1() -> StructResult:
-    raise NotImplementedError("A1")
+def test_A1() -> list[StructResult]:
+    import sympy as sp
+    from src.kernels import _fabry_airy_pol
+
+    r1, r2, delta = sp.symbols("r1 r2 delta", real=True)
+    numer = r1**2 + r2**2 + 2*r1*r2*sp.cos(delta)
+    denom = 1 + r1**2*r2**2 + 2*r1*r2*sp.cos(delta)
+    residual = sp.expand(denom - numer)
+    target   = sp.expand((1 - r1**2) * (1 - r2**2))
+
+    # Check 1: symbolic identity, exact (no tolerance -- either sympy
+    # simplifies the difference to the zero polynomial or it doesn't).
+    identity_diff = sp.expand(residual - target)
+
+    # Check 2: residual has zero delta-dependence (contradicts the notes'
+    # literal "(1-cos delta)" factor -- confirms it's a transcription slip).
+    ddelta = sp.diff(residual, delta)
+
+    # Check 3: free-standing (air-film-air) corollary, r2 = -r1 -- this is
+    # the specific case src/kernels.py's _fabry_airy_pol actually implements.
+    # Confirms the general two-interface algebra above specializes exactly
+    # to the production formula: numer -> 2*r1^2*(1-cos(delta)),
+    # denom -> 1 - 2*r1^2*cos(delta) + r1^4.
+    numer_ff = sp.expand(numer.subs(r2, -r1))
+    denom_ff = sp.expand(denom.subs(r2, -r1))
+    numer_ff_target = sp.expand(2*r1**2*(1 - sp.cos(delta)))
+    denom_ff_target = sp.expand(1 - 2*r1**2*sp.cos(delta) + r1**4)
+    ff_diff = sp.expand((numer_ff - numer_ff_target) + (denom_ff - denom_ff_target))
+
+    # Check 4: numeric cross-check of the free-standing corollary against
+    # the ACTUAL runtime code (_fabry_airy_pol), not just its symbolic
+    # target -- random r12 in (-1,1), random phi -- confirms sympy's
+    # specialization matches what the codebase actually computes.
+    torch.manual_seed(0)
+    n_samples = 2000
+    r12_t = (torch.rand(n_samples, dtype=torch.float64) * 2 - 1) * 0.999
+    phi_t = torch.rand(n_samples, dtype=torch.float64) * 2 * torch.pi
+    R_code = _fabry_airy_pol(r12_t, phi_t)
+    R_formula = (2 * r12_t**2 * (1 - torch.cos(phi_t))) / (1 - 2*r12_t**2*torch.cos(phi_t) + r12_t**4)
+    max_code_formula_err = (R_code - R_formula).abs().max().item()
+
+    # Check 5: numeric bound sweep over the GENERAL two-interface formula
+    # (independent r1,r2, not just the free-standing r2=-r1 case) -- confirm
+    # R stays in [0,1] and the analytic margin (1-r1^2)(1-r2^2) matches the
+    # directly-computed denom-numer to machine precision, for many random
+    # (r1,r2,delta) triples with |r1|,|r2|<1.
+    r1_t = (torch.rand(n_samples, dtype=torch.float64) * 2 - 1) * 0.999
+    r2_t = (torch.rand(n_samples, dtype=torch.float64) * 2 - 1) * 0.999
+    d_t  = torch.rand(n_samples, dtype=torch.float64) * 2 * torch.pi
+    numer_n = r1_t**2 + r2_t**2 + 2*r1_t*r2_t*torch.cos(d_t)
+    denom_n = 1 + r1_t**2*r2_t**2 + 2*r1_t*r2_t*torch.cos(d_t)
+    R_n = numer_n / denom_n
+    margin_analytic = (1 - r1_t**2) * (1 - r2_t**2)
+    margin_direct   = denom_n - numer_n
+    max_margin_err  = (margin_analytic - margin_direct).abs().max().item()
+    R_min, R_max = R_n.min().item(), R_n.max().item()
+
+    return [
+        StructResult("A1", "symbolic identity: denom-numer == (1-r1^2)(1-r2^2) exactly",
+                     0.0 if identity_diff == 0 else 1.0, 0.0,
+                     0.0 if identity_diff == 0 else 1.0, 0.0, identity_diff == 0,
+                     f"sympy.expand(residual - target) = {identity_diff}"),
+        StructResult("A1", "residual has zero delta-dependence (notes' '(1-cos delta)' factor doesn't survive)",
+                     0.0 if ddelta == 0 else 1.0, 0.0,
+                     0.0 if ddelta == 0 else 1.0, 0.0, ddelta == 0,
+                     f"d(residual)/d(delta) = {ddelta} -- flags a transcription slip in running_notes' A1 row"),
+        StructResult("A1", "free-standing (r2=-r1) corollary matches code's target formula symbolically",
+                     0.0 if ff_diff == 0 else 1.0, 0.0,
+                     0.0 if ff_diff == 0 else 1.0, 0.0, ff_diff == 0,
+                     f"sympy.expand(...) residual = {ff_diff} -- general algebra specializes exactly "
+                     "to _fabry_airy_pol's air-film-air convention"),
+        StructResult("A1", "free-standing corollary matches ACTUAL _fabry_airy_pol runtime, numerically",
+                     max_code_formula_err, 0.0, max_code_formula_err, 1e-13, max_code_formula_err < 1e-13,
+                     f"max|R_code - R_formula| over {n_samples} random (r12,phi) samples"),
+        StructResult("A1", "numeric bound sweep: R in [0,1] and analytic margin matches denom-numer directly",
+                     max(max_margin_err, max(0.0, -R_min), max(0.0, R_max - 1.0)), 0.0,
+                     max(max_margin_err, max(0.0, -R_min), max(0.0, R_max - 1.0)), 1e-12,
+                     max_margin_err < 1e-12 and R_min >= -1e-12 and R_max <= 1.0 + 1e-12,
+                     f"R range [{R_min:.6f}, {R_max:.6f}] over {n_samples} random (r1,r2,delta) "
+                     f"triples, |r1|,|r2|<1; max|analytic margin - direct margin| = {max_margin_err:.2e}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +267,14 @@ def main() -> None:
     rep = Reporter()
     for fn in ALL:
         try:
-            rep.add(fn())
+            result = fn()
+            if isinstance(result, list):
+                for r in result:
+                    rep.add(r)
+            else:
+                rep.add(result)
+        except OpenTheoreticalQuestion as e:
+            print(f"OPEN  {fn.__name__}: {e}")
         except NotImplementedError as e:
             print(f"SKIP  {fn.__name__}: {e}")
         except Exception as e:
