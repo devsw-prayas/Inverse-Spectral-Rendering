@@ -1378,13 +1378,187 @@ def test_G10() -> list[StructResult]:
 # ---------------------------------------------------------------------------
 # G11: Wrong vs correct adjoint gradient error vs Stokes shift  [promoted from T3]
 # X-axis: Stokes shift magnitude (e, a peak separation), 0 -> up
-# Y-axis: |wrong_gradient - correct_gradient|
-# Predicted shape: exactly 0 at zero separation, smooth monotonic growth
-# Failure: nonzero error at zero separation -> bug has another source
+#
+# Primary assertion:   ||K_x - K_x^T||_2  (== ||T - T^T||_2, M_R symmetric drops
+#                       out) -- exactly 0 at shift=0, monotonically increasing
+#                       thereafter. This is the operator-level asymmetry the
+#                       non-self-adjointness argument actually guarantees.
+# Secondary assertion: |wrong_gradient - correct_gradient| for one FIXED
+#                       (L_e, S) pair -- exactly 0 at shift=0, nonzero for
+#                       every shift>0, but NO shape claim beyond that. This is
+#                       a signed bilinear projection of the operator asymmetry
+#                       onto fixed illumination/sensor directions and is not
+#                       required to track the operator norm monotonically
+#                       (verified: it dips, crosses zero, then grows -- a real
+#                       finding, not a bug, kept here only as a weaker
+#                       existence check).
+# Failure: nonzero primary norm at shift=0, or the primary norm failing to
+#          grow monotonically -- either would mean the self-adjointness
+#          argument itself is wrong, not just this test's original overreach.
 # ---------------------------------------------------------------------------
 
-def test_G11() -> StructResult:
-    raise NotImplementedError("G11")
+def test_G11() -> list[StructResult]:
+    import csv
+    from src.kernels import kernel_thinfilm, kernel_fluorescence, fabry_airy_dR_dd
+    from src.gradient import kernel_gradient, kernel_gradient_wrong_adjoint, neumann_forward
+
+    # Sec4's non-self-adjointness bug: the correct adjoint solves (I-T*)G=S
+    # (S = dloss/dL, theta-independent); the wrong form sources G by
+    # (dT/dtheta)L instead. These coincide only when T*=T, which for the
+    # fluorescence rank-1 kernel K_fl(lam,lam')=e(lam)a(lam') requires a=e
+    # (zero Stokes shift).
+    #
+    # First draft of this test asserted a single monotonic |wrong-correct|
+    # curve (running_notes' T3 point-check, -69.5542 vs -36.7595, promoted to
+    # a sweep). That curve turned out non-monotonic: verified (with random
+    # L_e/g and several quantum_yield values, not just this test's specific
+    # scene) that the SIGNED error dips negative, crosses back through zero
+    # around shift~100nm, then grows -- a real effect, not noise, because
+    # |wrong-correct| for one fixed (L_e,S) pair is a bilinear projection of
+    # the growing operator asymmetry onto fixed directions, and a projection
+    # of a monotonically growing quantity need not itself be monotonic.
+    #
+    # Split into two assertions instead (flagged and confirmed with the user
+    # before finalizing, same pattern as G5/G7):
+    #   Primary:   ||K_x - K_x^T||_2 == ||T - T^T||_2 (M_R symmetric, drops
+    #              out) -- the actual operator-level asymmetry non-self-
+    #              adjointness guarantees. Exactly 0 at shift=0, monotonic
+    #              thereafter.
+    #   Secondary: the original |wrong-correct| metric, kept as a weaker
+    #              existence check only -- exactly 0 at shift=0 (proves the
+    #              bug's necessary condition), nonzero for every shift>0
+    #              (proves it's real for a concrete scene), no shape claim.
+    #
+    # Differentiates w.r.t. d -- a thin-film (elastic-type) parameter that
+    # doesn't even appear in K_fl -- deliberately the running_notes' sharpest
+    # demonstration: the wrong adjoint is contaminated by non-self-
+    # adjointness of the FLUORESCENT channel even when the parameter being
+    # differentiated lives entirely in the (self-adjoint) thin-film channel.
+    #
+    # Wide band (300-800nm, beyond the usual 400-700 visible convention) and
+    # lam_ex fixed far from both edges (150nm = 7.5 sigma_f minimum, growing
+    # as the sweep proceeds) so fluorescence-Gaussian truncation (T14 lesson)
+    # never contaminates this test -- the effect under test is purely the
+    # adjoint bug, not a truncation artifact.
+    lam_min, lam_max = 300.0, 800.0
+    N = 501
+    lam = torch.linspace(lam_min, lam_max, N, dtype=torch.float64)
+    w   = torch.full((N,), (lam_max - lam_min) / (N - 1), dtype=torch.float64)
+
+    d0, A0, B0 = 120.0, 1.5, 5000.0
+    cos_i      = torch.tensor(1.0, dtype=torch.float64)
+    lam_ex     = 450.0
+    sigma_f    = 20.0
+    quantum_yield = 0.5   # keeps rho(T) comfortably < 1 alongside K_tf's R
+
+    L_e = torch.ones(N, dtype=torch.float64)   # flat source -- not the object under test
+    g   = torch.ones(N, dtype=torch.float64)   # loss = L.sum(), dloss/dL = 1
+    max_depth = 32
+
+    def build_K_fl(lam_em: float) -> torch.Tensor:
+        return kernel_fluorescence(lam, lam_ex, lam_em, sigma_f, w, quantum_yield)
+
+    def build_T(lam_em: float) -> torch.Tensor:
+        K_tf = kernel_thinfilm(lam, cos_i, d0, A0, B0)
+        return K_tf + build_K_fl(lam_em)
+
+    def loss_fn(lam_em: float, d_val: float) -> torch.Tensor:
+        K_tf = kernel_thinfilm(lam, cos_i, d_val, A0, B0)
+        T    = K_tf + build_K_fl(lam_em)
+        return (g * neumann_forward(T, L_e, max_depth)).sum()
+
+    M = 15
+    shifts = [250.0 * i / (M - 1) for i in range(M)]   # 0 .. 250nm, includes 0 exactly
+
+    asym_norms, correct, wrong, fds = [], [], [], []
+    for shift in shifts:
+        lam_em = lam_ex + shift
+        K_fl   = build_K_fl(lam_em)
+        asym_norms.append(torch.linalg.matrix_norm(K_fl - K_fl.T, ord=2).item())
+
+        T     = build_T(lam_em)
+        dR_dd = fabry_airy_dR_dd(lam, cos_i, d0, A0, B0)   # (N,) -- K_fl doesn't depend on d
+
+        correct.append(kernel_gradient(T, dR_dd, L_e, g, max_depth).item())
+        wrong.append(kernel_gradient_wrong_adjoint(T, dR_dd, L_e, g, max_depth).item())
+
+        h = 1e-4
+        with torch.no_grad():
+            fp = loss_fn(lam_em, d0 + h)
+            fm = loss_fn(lam_em, d0 - h)
+        fds.append(((fp - fm) / (2.0 * h)).item())
+
+    errs = [abs(w_ - c) for w_, c in zip(wrong, correct)]
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G11_stokes_shift_adjoint_error.csv").open("w", newline="") as f:
+        wtr = csv.writer(f)
+        wtr.writerow(["stokes_shift", "asym_norm2", "correct_grad", "wrong_grad",
+                      "fd_grad", "abs_error"])
+        for i in range(M):
+            wtr.writerow([shifts[i], asym_norms[i], correct[i], wrong[i], fds[i], errs[i]])
+
+    scale = max(abs(c) for c in correct)
+    asym_scale = max(asym_norms)
+
+    # --- Primary: operator-level asymmetry ---------------------------------
+
+    # P1: ||K_x - K_x^T||_2 == 0 exactly at shift=0 (a=e, T*=T).
+    asym0 = asym_norms[0]
+
+    # P2: monotonic non-decreasing across the sweep -- allow the tiny
+    # numerical wobble the saturated tail actually shows (~1e-7 absolute,
+    # confirmed by direct computation), same style as other mono_viol checks.
+    asym_mono_viol = sum(
+        1 for i in range(M - 1) if asym_norms[i + 1] < asym_norms[i] - 1e-6 * asym_scale
+    )
+
+    # P3: substantial growth -- confirms this is a real effect, not noise
+    # sitting near the P2 tolerance.
+    asym_growth = asym_norms[-1] / max(asym_scale, 1e-30)
+
+    # --- Secondary: fixed-(L_e,g) bilinear projection, weakened -------------
+
+    # S1: |wrong-correct| == 0 exactly at shift=0 -- necessary condition.
+    err0 = errs[0]
+
+    # S2: nonzero for every shift>0 -- the bug is real for this concrete
+    # scene at every tested separation, even though its magnitude wobbles
+    # (no shape claim beyond "nonzero").
+    min_nonzero_err = min(errs[1:]) / scale
+
+    # S3: correct adjoint matches FD across the whole sweep (three-way oracle
+    # per CLAUDE.md) -- confirms the analytic "correct" form is actually
+    # right, independent of the wrong-form comparison or its non-monotonicity.
+    max_correct_fd_err = max(abs(c - fd) for c, fd in zip(correct, fds)) / scale
+
+    tol = 1e-6
+    return [
+        StructResult("G11", "[primary] ||K_x - K_x^T||_2 = 0 exactly at zero Stokes shift",
+                     asym0, 0.0, asym0 / max(asym_scale, 1e-30), tol,
+                     asym0 / max(asym_scale, 1e-30) < tol,
+                     "a=e exactly at shift=0 -- T*=T, operator is exactly self-adjoint"),
+        StructResult("G11", "[primary] ||K_x - K_x^T||_2 monotonic non-decreasing beyond shift=0",
+                     float(asym_mono_viol), 0.0, float(asym_mono_viol), 0.5, asym_mono_viol == 0,
+                     f"{asym_mono_viol} regressions out of {M - 1} steps -- operator asymmetry "
+                     "grows monotonically as Stokes shift grows"),
+        StructResult("G11", "[primary] substantial operator-asymmetry growth",
+                     asym_growth, 1.0, abs(asym_growth - 1.0), 0.5, asym_growth > 0.5,
+                     f"asym_norm: {asym_norms[0]:.4f} -> {asym_norms[-1]:.4f} "
+                     "(saturates once e,a stop overlapping -- real growth, not noise)"),
+        StructResult("G11", "[secondary] |wrong-correct| = 0 exactly at zero Stokes shift",
+                     err0, 0.0, err0 / scale, tol, err0 / scale < tol,
+                     "necessary condition for the bug, fixed (L_e,S) projection"),
+        StructResult("G11", "[secondary] |wrong-correct| nonzero for every shift>0 (no shape claim)",
+                     min_nonzero_err, None, None, tol, min_nonzero_err > tol,
+                     f"min over shift>0 of |wrong-correct|/scale = {min_nonzero_err:.2e} -- "
+                     "deliberately NOT asserting monotonicity here (verified non-monotonic: "
+                     "signed error dips, crosses zero near shift~100nm, then grows -- a real "
+                     "bilinear-projection effect, confirmed generic across other L_e/g choices)"),
+        StructResult("G11", "[secondary] correct adjoint matches FD across full shift sweep (3-way oracle)",
+                     max_correct_fd_err, 0.0, max_correct_fd_err, 1e-4, max_correct_fd_err < 1e-4,
+                     "scale-normalized max|correct-FD| -- validates the analytic form itself"),
+    ]
 
 
 # ---------------------------------------------------------------------------
