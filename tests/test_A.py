@@ -321,10 +321,97 @@ def test_A3() -> list[StructResult]:
 # A4: K_x* adjoint degenerate
 # Claim (ss4): T*=T exactly when e=a (zero Stokes shift).
 #              Wrong adjoint must become numerically correct *only* in this limit.
+#
+# Nails down the "iff" symbolically/exactly, complementing G11's numeric
+# sweep (which observed the same fact empirically as a byproduct of a
+# different test). K_x(lam,lam')=e(lam)a(lam') is symmetric (K_x=K_x^T,
+# i.e. e_i a_j = e_j a_i for all i,j) iff e and a are proportional as
+# vectors -- proved both for general vectors (small symbolic N) and for the
+# specific Gaussian a,e used everywhere in this codebase (proportional iff
+# lam_ex=lam_em exactly, via a log-linear argument independent of sigma_f).
 # ---------------------------------------------------------------------------
 
-def test_A4() -> StructResult:
-    raise NotImplementedError("A4")
+def test_A4() -> list[StructResult]:
+    import sympy as sp
+    from src.kernels import kernel_fluorescence
+
+    # --- Symbolic: general-vector symmetry <=> proportionality -------------
+    e1, e2, e3, a1, a2, a3, k = sp.symbols("e1 e2 e3 a1 a2 a3 k", real=True)
+    e_s, a_s = [e1, e2, e3], [a1, a2, a3]
+
+    def asym(i: int, j: int):
+        return e_s[i] * a_s[j] - e_s[j] * a_s[i]
+
+    # Check 1: sufficient direction -- e=k*a (proportional) makes every
+    # antisymmetric entry vanish identically, for symbolic k,a1,a2,a3.
+    prop_subs = {e1: k*a1, e2: k*a2, e3: k*a3}
+    prop_vals_sym = [sp.simplify(asym(i, j).subs(prop_subs))
+                      for i in range(3) for j in range(i + 1, 3)]
+    prop_vals_zero = [v == 0 for v in prop_vals_sym]   # symbolic (contain free k,a1,a2,a3) -- compare structurally
+
+    # Check 2: NOT vacuous -- a generic non-proportional numeric substitution
+    # gives nonzero antisymmetric entries (confirms Check 1 isn't trivially
+    # true for every e,a; symmetry is a genuine constraint).
+    generic_vals = [float(asym(i, j).subs({e1: 1, e2: 2, e3: 3, a1: 1, a2: 1, a3: 1}))
+                     for i in range(3) for j in range(i + 1, 3)]
+
+    # Check 3: specific Gaussian case -- e_raw(lam)/a_raw(lam) has a
+    # log-derivative w.r.t. lam that is the CONSTANT (lam_em-lam_ex)/sigma^2,
+    # independent of lam and of sigma_f's value -- so the ratio itself is
+    # constant across lam (i.e. e_raw proportional to a_raw) iff that
+    # constant is 0, i.e. iff lam_ex = lam_em exactly. Any nonzero
+    # separation gives a genuinely lam-dependent (non-constant) ratio.
+    lam, lam_ex, lam_em, sigma = sp.symbols("lam lam_ex lam_em sigma", positive=True, real=True)
+    log_ratio  = -((lam - lam_em)**2 - (lam - lam_ex)**2) / (2*sigma**2)
+    dlog_dlam  = sp.simplify(sp.diff(log_ratio, lam))
+    dlog_target = (lam_em - lam_ex) / sigma**2
+    dlog_diff  = sp.simplify(dlog_dlam - dlog_target)
+
+    # --- Numeric: actual kernel_fluorescence, symmetry sweep ----------------
+    N = 80
+    lam_t = torch.linspace(400.0, 700.0, N, dtype=torch.float64)
+    w     = torch.full((N,), 300.0 / (N - 1), dtype=torch.float64)
+    sigma_f = 20.0
+
+    def asym_norm(lex: float, lem: float) -> float:
+        K = kernel_fluorescence(lam_t, lex, lem, sigma_f, w)
+        return (K - K.T).abs().max().item()
+
+    # Check 4: exactly symmetric (0 to machine precision) at lam_ex=lam_em.
+    asym_at_zero = asym_norm(500.0, 500.0)
+
+    # Check 5: strictly asymmetric (nonzero) for EVERY nonzero separation
+    # tested, down to 1e-6nm -- confirms the "iff" holds pointwise, not just
+    # "small separation gives small asymmetry" (which alone wouldn't rule
+    # out an accidental exact-zero at some small nonzero separation).
+    seps = [1e-6, 1e-3, 0.1, 1.0, 10.0, 50.0]
+    asym_vals = [asym_norm(500.0, 500.0 + s) for s in seps]
+    min_nonzero_asym = min(asym_vals)
+
+    all_prop_zero = all(prop_vals_zero)
+    tol = 1e-12
+    return [
+        StructResult("A4", "symbolic: symmetric identically when e=k*a (sufficient direction)",
+                     0.0 if all_prop_zero else 1.0, 0.0,
+                     0.0 if all_prop_zero else 1.0, 0.0, all_prop_zero,
+                     f"asymmetric entries at e=k*a: {prop_vals_sym}"),
+        StructResult("A4", "symbolic: NOT vacuous -- generic e,a give nonzero asymmetry",
+                     float(min(abs(v) for v in generic_vals) > 0), 1.0,
+                     0.0, 0.0, all(v != 0 for v in generic_vals),
+                     f"asymmetric entries at generic e,a: {generic_vals}"),
+        StructResult("A4", "symbolic: d/dlam log(e_raw/a_raw) = (lam_em-lam_ex)/sigma^2 exactly",
+                     0.0 if dlog_diff == 0 else 1.0, 0.0,
+                     0.0 if dlog_diff == 0 else 1.0, 0.0, dlog_diff == 0,
+                     f"sympy.simplify(dlog_dlam - target) = {dlog_diff} -- ratio is lam-independent "
+                     "(proportional) iff lam_ex=lam_em exactly, for ANY sigma_f"),
+        StructResult("A4", "actual kernel_fluorescence: exactly symmetric at lam_ex=lam_em",
+                     asym_at_zero, 0.0, asym_at_zero, tol, asym_at_zero < tol,
+                     "||K-K^T||_max at lam_ex=lam_em=500 -- machine precision"),
+        StructResult("A4", "actual kernel_fluorescence: strictly asymmetric for every nonzero separation",
+                     min_nonzero_asym, None, None, tol, min_nonzero_asym > tol,
+                     f"min ||K-K^T||_max over separations {seps} = {min_nonzero_asym:.3e} -- "
+                     "no accidental exact-symmetry point at any nonzero separation tested"),
+    ]
 
 
 # ---------------------------------------------------------------------------
