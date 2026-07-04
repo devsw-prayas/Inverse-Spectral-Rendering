@@ -1567,10 +1567,32 @@ def test_G11() -> list[StructResult]:
 # Y-axis: rendered pixel value, with MC-noise error bars
 # Predicted shape: perfectly flat line, error bars overlapping at every point
 # Failure: any visible slope within noise -- instant red flag for Theorem 7
+#
+# DEFERRED to Phase 2 (V2), decided with the user 2026-07-04 after weighing
+# the tradeoff explicitly: this test's own X-axis is tagged "(V-level,
+# rendered)" and its Y-axis requires MC-noise error bars -- but no Monte
+# Carlo estimator exists anywhere in this repo yet (G1-G11 all operate on
+# the deterministic Neumann-series/quadrature oracle). The actual point of
+# this test (== V2 in the V-series table) is whether a REAL path tracer's
+# estimator machinery -- MIS across elastic/fluorescent sampling strategies,
+# multi-bounce variance, real RNG-driven bias sources -- accidentally
+# introduces lambda_ex-dependence. A toy MC wrapper built now would just
+# sample-average the same deterministic formula G9 already validated exactly
+# against a closed form (Lemma B); it would show a flat line only because we
+# already proved the underlying quantity is exactly constant in lambda_ex,
+# testing RNG-noise-around-a-known-constant rather than estimator
+# robustness -- manufactured confidence, not real coverage. Implement this
+# once the Phase 2 C++ path tracer exists. In the meantime, Theorem 7's
+# invariance claim is already covered from two other angles: G9 (closed-form
+# slope through lambda_ex, exact to 1e-11) and T14 (the truncation boundary
+# where the theorem's exact-invariance hypothesis actually breaks down).
 # ---------------------------------------------------------------------------
 
 def test_G12() -> StructResult:
-    raise NotImplementedError("G12")
+    raise NotImplementedError(
+        "G12 deferred to Phase 2 (V2) -- needs a real MC path-tracer estimator, "
+        "not yet built; see comment above test_G12 for the full reasoning"
+    )
 
 
 # ---------------------------------------------------------------------------
