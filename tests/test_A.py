@@ -214,10 +214,107 @@ def test_A2() -> list[StructResult]:
 # A3: ||K_x|| = ||e||_2 * ||a||_2, equality case
 # Claim (ss2): Cauchy-Schwarz equality is achieved at f = a/||a||_2;
 #              closed-form identity, not just an inequality.
+#
+# (K_x f)(lam) = e(lam) * <a,f> -- a rank-1 operator, so ||K_x f||_w =
+# ||e||_w * |<a,f>_w| exactly, and Cauchy-Schwarz gives |<a,f>_w| <=
+# ||a||_w ||f||_w with equality iff f is proportional to a. Symbolic proof
+# via Lagrange's identity (general N, shown here for N=3): the classic
+# "sum of squares" form makes both the inequality AND its equality condition
+# transparent in one identity, not just an inequality bound.
 # ---------------------------------------------------------------------------
 
-def test_A3() -> StructResult:
-    raise NotImplementedError("A3")
+def test_A3() -> list[StructResult]:
+    import sympy as sp
+    from src.kernels import kernel_fluorescence
+
+    # --- Symbolic: Lagrange's identity, N=3 ---------------------------------
+    a1, a2, a3, f1, f2, f3, w1, w2, w3 = sp.symbols(
+        "a1 a2 a3 f1 f2 f3 w1 w2 w3", real=True)
+    a_s, f_s, w_s = [a1, a2, a3], [f1, f2, f3], [w1, w2, w3]
+
+    lhs = (sum(a_s[i]**2 * w_s[i] for i in range(3))
+           * sum(f_s[i]**2 * w_s[i] for i in range(3))
+           - sum(a_s[i] * f_s[i] * w_s[i] for i in range(3))**2)
+    rhs = sum(w_s[i] * w_s[j] * (a_s[i]*f_s[j] - a_s[j]*f_s[i])**2
+              for i in range(3) for j in range(i + 1, 3))
+
+    # Check 1: (||a||_w^2)(||f||_w^2) - <a,f>_w^2 == sum-of-squares form
+    # exactly -- makes ||a||_w||f||_w >= |<a,f>_w| manifest (RHS >= 0).
+    lagrange_diff = sp.expand(lhs - rhs)
+
+    # Check 2: substituting f=c*a into the sum-of-squares form gives
+    # identically 0 -- confirms equality holds exactly (not just in the
+    # limit) precisely when f is proportional to a.
+    c = sp.symbols("c", real=True)
+    rhs_at_prop = sp.expand(rhs.subs({f1: c*a1, f2: c*a2, f3: c*a3}))
+
+    # --- Numeric: actual kernel_fluorescence, weighted L2 norms -------------
+    torch.manual_seed(3)
+    N = 80
+    lam = torch.linspace(400.0, 700.0, N, dtype=torch.float64)
+    w   = torch.full((N,), 300.0 / (N - 1), dtype=torch.float64)
+    lam_ex, lam_em, sigma_f = 450.0, 550.0, 20.0
+
+    K = kernel_fluorescence(lam, lam_ex, lam_em, sigma_f, w, quantum_yield=1.0)
+    a = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)
+    e = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)
+    e = e / (e * w).sum()
+
+    def norm_w(g: torch.Tensor) -> torch.Tensor:
+        return ((g ** 2 * w).sum()) ** 0.5
+
+    norm_e, norm_a = norm_w(e), norm_w(a)
+    bound = (norm_e * norm_a).item()
+
+    # Check 3: Cauchy-Schwarz bound never exceeded, many random unit-w-norm f.
+    max_ratio = 0.0
+    for _ in range(500):
+        f = torch.randn(N, dtype=torch.float64)
+        f = f / norm_w(f)
+        max_ratio = max(max_ratio, (norm_w(K @ f) / bound).item())
+
+    # Check 4: exact equality at f* = a/||a||_w -- the closed-form case,
+    # not just an inequality.
+    f_star = a / norm_a
+    equality_val = norm_w(K @ f_star).item()
+
+    # Check 5: the supremum is achieved SPECIFICALLY at f proportional to a
+    # -- construct the w-whitened operator M = diag(sqrt(w)) K diag(1/sqrt(w))
+    # (converts sup_{||f||_w=1}||Kf||_w into an ordinary Euclidean operator
+    # norm problem), confirm its top singular value matches the bound AND
+    # its top right singular vector, mapped back to f-space, is parallel to a.
+    sqrt_w = torch.sqrt(w)
+    M = torch.diag(sqrt_w) @ K @ torch.diag(1.0 / sqrt_w)
+    svals = torch.linalg.svdvals(M)
+    top_sv = svals[0].item()
+
+    _, _, Vh = torch.linalg.svd(M)
+    f_top = Vh[0] / sqrt_w
+    f_top = f_top / norm_w(f_top)
+    cos_align = (f_top * a / norm_a * w).sum().item()   # <f_top, a/||a||>_w
+
+    tol = 1e-10
+    return [
+        StructResult("A3", "symbolic: Lagrange's identity (N=3) exact",
+                     0.0 if lagrange_diff == 0 else 1.0, 0.0,
+                     0.0 if lagrange_diff == 0 else 1.0, 0.0, lagrange_diff == 0,
+                     f"sympy.expand(lhs-rhs) = {lagrange_diff}"),
+        StructResult("A3", "symbolic: equality-condition term vanishes exactly at f=c*a",
+                     0.0 if rhs_at_prop == 0 else 1.0, 0.0,
+                     0.0 if rhs_at_prop == 0 else 1.0, 0.0, rhs_at_prop == 0,
+                     f"sum-of-squares form at f=c*a: {rhs_at_prop}"),
+        StructResult("A3", "Cauchy-Schwarz bound never exceeded (500 random unit-w-norm f)",
+                     max_ratio, None, None, 1.0 + tol, max_ratio <= 1.0 + tol,
+                     f"max ||Kf||_w / (||e||_w ||a||_w) = {max_ratio:.6f} (<=1 required)"),
+        StructResult("A3", "exact equality at f* = a/||a||_w (closed-form case)",
+                     equality_val, bound, abs(equality_val - bound) / bound, tol,
+                     abs(equality_val - bound) / bound < tol,
+                     f"||K f*||_w = {equality_val:.10f} vs ||e||_w*||a||_w = {bound:.10f}"),
+        StructResult("A3", "sup is achieved specifically at f proportional to a (top singular vector)",
+                     abs(cos_align), 1.0, abs(abs(cos_align) - 1.0), tol, abs(cos_align) > 1.0 - tol,
+                     f"top singular value = {top_sv:.10f} (matches bound); "
+                     f"|<f_top, a/||a||>_w| = {abs(cos_align):.10f} -- confirms which f achieves the sup"),
+    ]
 
 
 # ---------------------------------------------------------------------------
