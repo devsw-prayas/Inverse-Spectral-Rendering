@@ -1248,8 +1248,131 @@ def test_G9() -> list[StructResult]:
 # Failure: flat curve -> B/A confound isn't a spectral-leverage problem
 # ---------------------------------------------------------------------------
 
-def test_G10() -> StructResult:
-    raise NotImplementedError("G10")
+def test_G10() -> list[StructResult]:
+    import csv
+
+    # Reuses T9's exact 5-param model (fabry_airy_R + normalized fluorescence
+    # term, lam_ex held fixed since Sec9 already removes it from the
+    # parameter set): L_out(d,A,B,sf,lem) = R(lam;d,A,B) + e(lam;lem,sf)*abar.
+    # Sec10/Remark4's finding (independently reproduced by T9): the worst-
+    # conditioned direction is dominated by B (-0.78) paired with A (+0.58),
+    # because n(lam)=A+B/lam^2 -- dphi/dA ~ 1/lam, dphi/dB ~ 1/lam^3 -- and
+    # over a narrow band, 1/lam and 1/lam^3 both look locally linear in lam
+    # (Taylor expansion), making the A and B columns nearly collinear. G10
+    # tests the predicted fix: widening the observed band should expose the
+    # curvature difference between the two power laws and decorrelate them.
+    #
+    # lam_ex=520, lem=580 (Stokes shift 60nm = 6*sigma_f) are centered around
+    # band-center=550 with enough margin (sf=10nm) that even the narrowest
+    # bandwidth tested leaves both peaks resolved with >=3 sigma of margin to
+    # the nearest edge (T14 lesson: truncation of the fluorescence Gaussian
+    # against the window edge is a separate, already-documented effect that
+    # would contaminate the sf/lem columns if not kept small here).
+    from src.kernels import fabry_airy_R
+
+    center = 550.0
+    lam_ex = 520.0
+    d0, A0, B0, sf0, lem0 = 120.0, 1.5, 5000.0, 10.0, 580.0
+    alpha0 = 1.0
+    cos_i = torch.tensor(1.0, dtype=torch.float64)
+
+    def L_out_fn(lam, w, d, A, B, sf, lem):
+        R = fabry_airy_R(lam, cos_i, d, A, B)
+        a = torch.exp(-0.5 * ((lam - lam_ex) / sf) ** 2)
+        e = torch.exp(-0.5 * ((lam - lem) / sf) ** 2)
+        e = e / (e * w).sum().clamp(min=1e-30)
+        return R + e * (a * w).sum() * alpha0
+
+    def jacobian(lam, w):
+        ts = tuple(torch.tensor(v, dtype=torch.float64, requires_grad=True)
+                   for v in [d0, A0, B0, sf0, lem0])
+        cols = torch.autograd.functional.jacobian(
+            lambda *args: L_out_fn(lam, w, *args), ts, vectorize=True,
+        )
+        return torch.stack([c.detach() for c in cols], dim=1)   # (N, 5)
+
+    dlam = 1.0   # fixed sampling density -- N grows with bandwidth, not resolution
+    M = 14
+    half_widths = [60.0 * (300.0 / 60.0) ** (i / (M - 1)) for i in range(M)]
+
+    sv_all, conds, cos_ab = [], [], []
+    Jn_narrowest = None
+    for hw in half_widths:
+        lam_min, lam_max = center - hw, center + hw
+        N = int(round(2.0 * hw / dlam)) + 1
+        lam = torch.linspace(lam_min, lam_max, N, dtype=torch.float64)
+        w = torch.full((N,), (lam_max - lam_min) / (N - 1), dtype=torch.float64)
+
+        J = jacobian(lam, w)
+        col_scales = J.norm(dim=0).clamp(min=1e-30)
+        Jn = J / col_scales
+        svs = torch.linalg.svdvals(Jn)
+        sv_all.append(svs.tolist())
+        conds.append((svs[0] / svs[-1]).item())
+        if Jn_narrowest is None:
+            Jn_narrowest = Jn
+
+        colA, colB = J[:, 1], J[:, 2]
+        cos_ab.append((colA @ colB / (colA.norm() * colB.norm())).item())
+
+    sigma_min = [svs[-1] for svs in sv_all]
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    with (FIGURES_DIR / "G10_spectral_bandwidth.csv").open("w", newline="") as f:
+        wtr = csv.writer(f)
+        wtr.writerow(["half_width", "sv1", "sv2", "sv3", "sv4", "sv5",
+                      "condition_number", "cos_angle_A_B"])
+        for i in range(M):
+            wtr.writerow([half_widths[i], *sv_all[i], conds[i], cos_ab[i]])
+
+    # Check 1: sigma_min improves (non-decreasing) as bandwidth widens --
+    # allow a small fraction of steps to violate strict monotonicity from
+    # numerical noise, same style as G6's mono_viol check.
+    mono_viol_min = sum(1 for i in range(M - 1) if sigma_min[i + 1] < sigma_min[i] - 1e-9)
+
+    # Check 2: |cos(A,B)| decreases (decorrelates) as bandwidth widens.
+    abs_cos = [abs(c) for c in cos_ab]
+    mono_viol_cos = sum(1 for i in range(M - 1) if abs_cos[i + 1] > abs_cos[i] + 1e-9)
+
+    # Check 3: substantial net improvement, not just noise-level drift.
+    sigma_min_ratio = sigma_min[-1] / max(sigma_min[0], 1e-30)
+
+    # Check 4: substantial net decorrelation of the A,B columns.
+    cos_drop = abs_cos[0] - abs_cos[-1]
+
+    # Check 5: sanity check against Sec10/Remark4/T9's own finding -- at the
+    # narrowest bandwidth tested, the worst singular vector's two largest-
+    # magnitude components must be the A,B columns (indices 1,2), confirming
+    # this model reproduces the known bottleneck before testing how bandwidth
+    # affects it.
+    _, _, Vh = torch.linalg.svd(Jn_narrowest)
+    worst_vec = Vh[-1].abs()
+    top2 = torch.topk(worst_vec, 2).indices.tolist()
+    bottleneck_ok = set(top2) == {1, 2}
+
+    tol = 0.5
+    return [
+        StructResult("G10", "sigma_min monotonic non-decreasing with bandwidth",
+                     float(mono_viol_min), 0.0, float(mono_viol_min), tol,
+                     mono_viol_min == 0,
+                     f"{mono_viol_min} regressions out of {M - 1} steps as bandwidth widens"),
+        StructResult("G10", "|cos(colA,colB)| monotonic non-increasing with bandwidth",
+                     float(mono_viol_cos), 0.0, float(mono_viol_cos), tol,
+                     mono_viol_cos == 0,
+                     f"{mono_viol_cos} regressions out of {M - 1} steps; "
+                     f"cos: {abs_cos[0]:.4f} -> {abs_cos[-1]:.4f}"),
+        StructResult("G10", "substantial sigma_min improvement, narrow->wide",
+                     sigma_min_ratio, None, None, 2.0, sigma_min_ratio > 2.0,
+                     f"sigma_min({half_widths[0]:.0f}nm)={sigma_min[0]:.4g} -> "
+                     f"sigma_min({half_widths[-1]:.0f}nm)={sigma_min[-1]:.4g}"),
+        StructResult("G10", "substantial A,B column decorrelation, narrow->wide",
+                     cos_drop, None, None, 0.05, cos_drop > 0.05,
+                     f"|cos(A,B)| drops by {cos_drop:.4f} over the sweep"),
+        StructResult("G10", "worst singular vector dominated by (A,B) at narrowest bandwidth",
+                     float(bottleneck_ok), 1.0, float(not bottleneck_ok), 0.5, bottleneck_ok,
+                     f"top-2 |components| indices={top2} (0=d,1=A,2=B,3=sf,4=lem) -- "
+                     "matches Sec10/Remark4/T9's B-paired-with-A finding"),
+    ]
 
 
 # ---------------------------------------------------------------------------
