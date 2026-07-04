@@ -136,10 +136,78 @@ def test_A1() -> list[StructResult]:
 # A2: dR/dd at d->0
 # Claim (ss1): symbolic limit of dR/dd as d->0 must vanish or match
 #              bare-Fresnel derivative -- zero-thickness film has no interference.
+#
+# Resolved as "vanishes", by a cleaner argument than direct differentiation:
+# phi(d) = k*d is ODD in d (k = 4*pi*n*cos_t/lam, constant w.r.t. d), and
+# R depends on d only through cos(phi(d)) -- cos is even in its argument, so
+# R(-d) = R(d) IDENTICALLY (free-standing air-film-air case, r2=-r1). An even
+# function's derivative at 0 is always exactly 0, independent of the precise
+# rational-function form -- a more general proof than computing dR/dd
+# explicitly and taking the limit (done too, as a second confirmation).
+# Physically: shrinking a free-standing film to zero thickness makes it
+# disappear into the surrounding medium (air-air, no interface at all), not
+# "the bare single-surface Fresnel reflectance" -- that alternative only
+# applies to a film on a DIFFERENT substrate, which fabry_airy_R doesn't
+# model (kernel_thinfilm is air-film-air only; see G7's separate 3-layer
+# R3_s for the substrate case).
 # ---------------------------------------------------------------------------
 
-def test_A2() -> StructResult:
-    raise NotImplementedError("A2")
+def test_A2() -> list[StructResult]:
+    import sympy as sp
+    from src.kernels import fabry_airy_dR_dd
+
+    r1, k, d = sp.symbols("r1 k d", real=True)
+    phi   = k * d
+    numer = 2 * r1**2 * (1 - sp.cos(phi))
+    denom = 1 - 2 * r1**2 * sp.cos(phi) + r1**4
+    R     = numer / denom
+
+    # Check 1: R(d) is even in d -- symbolic, general r1,k.
+    even_diff = sp.simplify(R - R.subs(d, -d))
+
+    # Check 2: therefore dR/dd at d=0 is exactly 0 -- direct symbolic
+    # confirmation via differentiation + limit, general r1,k.
+    dRdd    = sp.diff(R, d)
+    dRdd_at0 = sp.limit(dRdd, d, 0)
+
+    # Check 3: the ACTUAL code's analytic fabry_airy_dR_dd gives exactly 0 at
+    # d=0, for many random physical (A,B,cos_i) configurations -- not just
+    # the abstract r1,k symbols above.
+    torch.manual_seed(2)
+    n_trials = 50
+    N = 20
+    lam = torch.linspace(400.0, 700.0, N, dtype=torch.float64)
+    max_d0_val = 0.0
+    for _ in range(n_trials):
+        A_r     = (torch.rand(()) * 1.0 + 1.0).item()          # A in [1,2)
+        B_r     = (torch.rand(()) * 8000.0 + 1000.0).item()    # B in [1000,9000)
+        cos_i_r = (torch.rand(()) * 0.9 + 0.1).item()          # cos_i in [0.1,1.0)
+        dR = fabry_airy_dR_dd(lam, torch.tensor(cos_i_r), 0.0, A_r, B_r)
+        max_d0_val = max(max_d0_val, dR.abs().max().item())
+
+    # Check 4: sanity -- away from d=0, dR/dd is generically nonzero. This
+    # isn't a formula that's identically 0 everywhere; the vanishing is
+    # specific to the degenerate d=0 point.
+    dR_away = fabry_airy_dR_dd(lam, torch.tensor(0.8), 120.0, 1.5, 5000.0)
+    away_max = dR_away.abs().max().item()
+
+    return [
+        StructResult("A2", "symbolic: R(d) is even in d (free-standing film)",
+                     0.0 if even_diff == 0 else 1.0, 0.0,
+                     0.0 if even_diff == 0 else 1.0, 0.0, even_diff == 0,
+                     f"sympy.simplify(R(d)-R(-d)) = {even_diff}"),
+        StructResult("A2", "symbolic: dR/dd -> 0 exactly at d=0 (even function's derivative at 0)",
+                     0.0 if dRdd_at0 == 0 else 1.0, 0.0,
+                     0.0 if dRdd_at0 == 0 else 1.0, 0.0, dRdd_at0 == 0,
+                     f"sympy.limit(dR/dd, d, 0) = {dRdd_at0}"),
+        StructResult("A2", "actual fabry_airy_dR_dd = 0 exactly at d=0, over random (A,B,cos_i)",
+                     max_d0_val, 0.0, max_d0_val, 1e-13, max_d0_val < 1e-13,
+                     f"max|dR/dd| at d=0 over {n_trials} random physical configs"),
+        StructResult("A2", "sanity: dR/dd is generically NONZERO away from d=0",
+                     away_max, None, None, 1e-6, away_max > 1e-6,
+                     f"max|dR/dd| at d=120nm = {away_max:.4f} -- vanishing is specific to d=0, "
+                     "not a trivially-zero formula"),
+    ]
 
 
 # ---------------------------------------------------------------------------
