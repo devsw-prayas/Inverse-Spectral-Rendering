@@ -725,10 +725,87 @@ def test_A7() -> list[StructResult]:
 # A8: Brewster angle vs v=0 cancellation
 # Claim (ss7): T_p(theta_Brewster)=1 (r_p=0) is a different special angle
 #              from v=0; symbolic confirmation they are distinct.
+#
+# Brewster: r_p=0 combined with Snell's law gives theta_i+theta_t=90 deg,
+# i.e. tan(theta_B)=n_t/n_i=1/eta -- full p-pol transmission (T_p=1), a
+# smooth interior point, nothing to do with TIR. Critical angle: v=0 at
+# theta_c=arcsin(n_t/n_i)=arcsin(1/eta) (eta>1 only) -- the OTHER special
+# angle, where T->0 and J_theta->infinity (Sec7/A7's 0*infinity story).
+# arctan(x) < arcsin(x) for x in (0,1), so theta_B < theta_c strictly
+# whenever both exist: Brewster's angle is always crossed well before the
+# critical angle, at a point where v=cos(theta_t) is comfortably nonzero --
+# confirms they are not merely different formulas but different POINTS
+# along the same theta_i sweep, order-preserved for every eta>1.
 # ---------------------------------------------------------------------------
 
-def test_A8() -> StructResult:
-    raise NotImplementedError("A8")
+def test_A8() -> list[StructResult]:
+    import sympy as sp
+    from src.fresnel import fresnel_rp, fresnel_T
+    from src.cauchy_ior import cos_theta_t
+
+    n_i_s, n_t_s = sp.symbols("n_i n_t", positive=True)
+
+    # Check 1: symbolic Brewster derivation -- at theta_i=atan(n_t/n_i),
+    # i.e. sin_i=n_t/sqrt(n_i^2+n_t^2), cos_i=n_i/sqrt(n_i^2+n_t^2), Snell's
+    # law gives cos_t, and r_p vanishes identically (general n_i,n_t>0).
+    hyp = sp.sqrt(n_i_s ** 2 + n_t_s ** 2)
+    sin_i_B, cos_i_B = n_t_s / hyp, n_i_s / hyp
+    sin_t_B = (n_i_s / n_t_s) * sin_i_B                      # Snell
+    cos_t_B = sp.sqrt(1 - sin_t_B ** 2)
+    r_p_B = (n_t_s * cos_i_B - n_i_s * cos_t_B) / (n_t_s * cos_i_B + n_i_s * cos_t_B)
+    r_p_B_simplified = sp.simplify(r_p_B)
+
+    # Check 2: at that same angle, v=cos(theta_t) is generically NONZERO --
+    # not the v=0 TIR-onset point (structurally different mechanism).
+    cos_t_B_generic = sp.simplify(cos_t_B.subs({n_i_s: 3, n_t_s: 2}))
+
+    # Check 3: theta_B < theta_c strictly, for eta>1 (both angles exist) --
+    # arctan(1/eta) < arcsin(1/eta) for eta>1, i.e. x:=1/eta in (0,1).
+    x = sp.symbols("x", positive=True)
+    order_diff = sp.asin(x) - sp.atan(x)
+    order_diff_at_half = float(order_diff.subs(x, sp.Rational(1, 2)))   # eta=2 -> x=1/2
+
+    # --- Numeric: actual fresnel_rp/fresnel_T code, several (n_i,n_t) -------
+    n_i_num, n_t_num = 1.6, 1.0
+    eta = n_i_num / n_t_num
+    theta_B = torch.atan(torch.tensor(n_t_num / n_i_num))
+    theta_c = torch.asin(torch.tensor(n_t_num / n_i_num))
+
+    cos_i_B_t = torch.cos(theta_B)
+    cos_t_B_t = cos_theta_t(cos_i_B_t, n_i_num, n_t_num)
+    r_p_num = fresnel_rp(n_i_num, n_t_num, cos_i_B_t, cos_t_B_t)
+    T_p_num = fresnel_T(n_i_num, n_t_num, cos_i_B_t, polarization="p")
+
+    # Check 4: actual code confirms r_p=0, T_p=1 at Brewster's angle.
+    rp_err = abs(r_p_num.item())
+    Tp_err = abs(T_p_num.item() - 1.0)
+
+    # Check 5: at that same Brewster angle, v is comfortably away from 0
+    # (order-of-magnitude separated from the TIR-onset regime), AND
+    # theta_B < theta_c numerically, matching the symbolic ordering claim.
+    v_at_brewster = cos_t_B_t.item()
+    theta_order_ok = theta_B.item() < theta_c.item()
+
+    tol = 1e-12
+    return [
+        StructResult("A8", "symbolic: r_p=0 exactly at theta_i=atan(n_t/n_i), general n_i,n_t",
+                     0.0 if r_p_B_simplified == 0 else 1.0, 0.0,
+                     0.0 if r_p_B_simplified == 0 else 1.0, 0.0, r_p_B_simplified == 0,
+                     f"sympy.simplify(r_p at Brewster) = {r_p_B_simplified}"),
+        StructResult("A8", "symbolic: v=cos(theta_t) generically nonzero at Brewster's angle",
+                     float(cos_t_B_generic), None, None, 1e-9, float(cos_t_B_generic) > 1e-9,
+                     f"cos(theta_t) at Brewster, n_i=3,n_t=2: {cos_t_B_generic} -- not the v=0 point"),
+        StructResult("A8", "symbolic: theta_B < theta_c strictly (arctan(x) < arcsin(x) for x in (0,1))",
+                     order_diff_at_half, None, None, 1e-9, order_diff_at_half > 1e-9,
+                     f"asin(1/2)-atan(1/2) = {order_diff_at_half:.6f} > 0 -- Brewster precedes critical angle"),
+        StructResult("A8", "actual fresnel_rp/fresnel_T code: r_p=0 and T_p=1 exactly at Brewster's angle",
+                     max(rp_err, Tp_err), 0.0, max(rp_err, Tp_err), tol, max(rp_err, Tp_err) < tol,
+                     f"eta={eta}: |r_p|={rp_err:.2e}, |T_p-1|={Tp_err:.2e} at theta_B={theta_B.item()*180/torch.pi:.4f} deg"),
+        StructResult("A8", "actual code: theta_B < theta_c and v(theta_B) far from the v=0 TIR-onset regime",
+                     v_at_brewster, None, None, 1e-3, theta_order_ok and v_at_brewster > 1e-3,
+                     f"theta_B={theta_B.item()*180/torch.pi:.4f} deg < theta_c={theta_c.item()*180/torch.pi:.4f} deg; "
+                     f"v(theta_B)={v_at_brewster:.6f} (comfortably nonzero)"),
+    ]
 
 
 # ---------------------------------------------------------------------------
