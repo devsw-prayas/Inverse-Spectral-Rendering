@@ -418,10 +418,104 @@ def test_A4() -> list[StructResult]:
 # A5: v ~ sqrt(2u) branch order
 # Claim (ss5): Puiseux series of v(u) about u=0 has leading order u^(1/2)
 #              with coefficient sqrt(2); no u^1 or u^0 term at leading order.
+#
+# Section 5's setup: u := 1-s, s = (n_i/n_t)*sin(theta_i) (distance from
+# criticality in the natural sampling variable), v = cos(theta_t) =
+# sqrt(1-s^2) = sqrt((1-s)(1+s)) = sqrt(u*(2-u)) since 1+s = 2-u. Section 5
+# asserts v ~ sqrt(2u) near u=0 and (separately, from prior-session scratch
+# work) that every subsequent term in the series sits at a half-integer
+# power (3/2, 5/2, ...) -- no integer-power (u^0, u^1) leakage that would
+# make v locally look linear or offset near the branch point.
 # ---------------------------------------------------------------------------
 
-def test_A5() -> StructResult:
-    raise NotImplementedError("A5")
+def test_A5() -> list[StructResult]:
+    import sympy as sp
+    from src.cauchy_ior import cos_theta_t
+
+    u = sp.symbols("u", positive=True)
+    v = sp.sqrt(u * (2 - u))
+
+    # Check 1: symbolic Puiseux series about u=0, leading term coefficient.
+    n_terms = 4
+    ser = sp.series(v, u, 0, n_terms).removeO()
+    terms = sp.Add.make_args(sp.expand(ser))
+    coeff_exp = sorted((t.as_coeff_exponent(u) for t in terms), key=lambda ce: ce[1])
+    leading_coeff, leading_exp = coeff_exp[0]
+    leading_diff = sp.simplify(leading_coeff - sp.sqrt(2))
+
+    # Check 2: leading exponent is exactly 1/2 (the branch-point order).
+    exp_diff = sp.simplify(leading_exp - sp.Rational(1, 2))
+
+    # Check 3: no u^0 or u^1 (integer-power) term survives anywhere in the
+    # expansion -- reject if either appears among the recovered exponents.
+    exponents = [ce[1] for ce in coeff_exp]
+    has_integer_leak = any(e == 0 or e == 1 for e in exponents)
+
+    # Check 4: every recovered exponent is a half-integer (odd multiple of
+    # 1/2) -- the "half-integer powers only" claim from prior scratch work,
+    # not just "the leading term happens to be u^(1/2)".
+    all_half_integer = all(sp.simplify(2 * e - sp.floor(2 * e)) == 0 and
+                            sp.simplify(e - sp.floor(e)) != 0 for e in exponents)
+
+    # Check 5: numeric, using the abstract sqrt(u*(2-u)) formula directly --
+    # v/sqrt(2u) -> 1 as u -> 0, swept across many orders of magnitude. The
+    # asymptotic is a NEAR-u=0 statement, not a global identity (at u=0.5 the
+    # O(u) correction is a genuine 13% effect) -- so the check is convergence
+    # (deviation shrinks monotonically, final point near-exact), not a flat
+    # bound over the whole sweep.
+    u_vals = torch.tensor([0.5 * 10 ** (-k) for k in range(8)], dtype=torch.float64)
+    v_vals = torch.sqrt(u_vals * (2 - u_vals))
+    dev_abstract = (v_vals / torch.sqrt(2 * u_vals) - 1.0).abs()
+    monotone_abstract = bool((dev_abstract[1:] <= dev_abstract[:-1] + 1e-15).all())
+    final_dev_abstract = dev_abstract[-1].item()
+
+    # Check 6: cross-check against the ACTUAL cos_theta_t() code (not just
+    # the abstract u,v symbols) -- scalar Snell setup matching sec5's
+    # verification note (n_i=1.5, n_t=A=1.0), sweeping incidence angle to
+    # approach the critical angle from u=0.5 down to u=5e-9. cos_theta_t()
+    # must match the sqrt(u(2-u)) formula EXACTLY at every u (both compute
+    # the same sqrt(1-s^2), just via different intermediate variables) --
+    # that's a flat check; only the v/sqrt(2u)->1 trend is asymptotic.
+    n_i, n_t = 1.5, 1.0
+    eta = n_t / n_i
+    s_vals = 1.0 - u_vals
+    sin_i_vals = s_vals * eta
+    cos_i_vals = torch.sqrt(1.0 - sin_i_vals ** 2)
+    v_code = cos_theta_t(cos_i_vals, n_i, n_t)
+    max_code_formula_err = (v_code - v_vals).abs().max().item()
+    final_dev_code = (v_code[-1] / torch.sqrt(2 * u_vals[-1]) - 1.0).abs().item()
+
+    tol = 1e-9
+    conv_tol = 2e-8   # final point is u=5e-8; deviation ~ u/4, not machine-eps
+    return [
+        StructResult("A5", "symbolic: Puiseux leading coefficient == sqrt(2) exactly",
+                     0.0 if leading_diff == 0 else 1.0, 0.0,
+                     0.0 if leading_diff == 0 else 1.0, 0.0, leading_diff == 0,
+                     f"leading term = {leading_coeff}*u^{leading_exp}; coeff - sqrt(2) = {leading_diff}"),
+        StructResult("A5", "symbolic: leading exponent == 1/2 exactly",
+                     0.0 if exp_diff == 0 else 1.0, 0.0,
+                     0.0 if exp_diff == 0 else 1.0, 0.0, exp_diff == 0,
+                     f"leading exponent = {leading_exp}"),
+        StructResult("A5", "symbolic: no u^0 or u^1 term survives in the expansion",
+                     1.0 if has_integer_leak else 0.0, 0.0,
+                     1.0 if has_integer_leak else 0.0, 0.0, not has_integer_leak,
+                     f"recovered exponents = {exponents}"),
+        StructResult("A5", "symbolic: every surviving term sits at a half-integer power",
+                     0.0 if all_half_integer else 1.0, 0.0,
+                     0.0 if all_half_integer else 1.0, 0.0, all_half_integer,
+                     f"exponents {exponents} -- all odd multiples of 1/2, no even (integer) powers"),
+        StructResult("A5", "numeric (abstract sqrt(u(2-u))): v/sqrt(2u) -> 1 as u -> 0, monotonically",
+                     final_dev_abstract, 0.0, final_dev_abstract, conv_tol,
+                     monotone_abstract and final_dev_abstract < conv_tol,
+                     f"deviation |v/sqrt(2u)-1| shrinks monotonically over u in {u_vals.tolist()}; "
+                     f"final (u={u_vals[-1].item():.0e}) = {final_dev_abstract:.2e}"),
+        StructResult("A5", "actual cos_theta_t() code matches sqrt(u(2-u)) formula exactly, and same v/sqrt(2u)->1 limit",
+                     max(max_code_formula_err, final_dev_code), 0.0,
+                     max(max_code_formula_err, final_dev_code),
+                     max(tol, conv_tol), max_code_formula_err < tol and final_dev_code < conv_tol,
+                     f"n_i={n_i}, n_t={n_t}: max|v_code - sqrt(u(2-u))| = {max_code_formula_err:.2e} (flat, all u), "
+                     f"final |v_code/sqrt(2u) - 1| = {final_dev_code:.2e} (asymptotic, u={u_vals[-1].item():.0e})"),
+    ]
 
 
 # ---------------------------------------------------------------------------
