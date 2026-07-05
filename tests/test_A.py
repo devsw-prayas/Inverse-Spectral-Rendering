@@ -522,10 +522,124 @@ def test_A5() -> list[StructResult]:
 # A6: J_||, J_perp, det limits
 # Claim (ss6): At theta_i=0: J_||=J_perp=eta exactly (formulas collapse).
 #              At theta_i->90 deg: confirm divergence *rate* of det.
+#
+# J_perp=eta (constant), J_par=eta*cos_i/cos_t, det=J_perp*J_par=eta^2*cos_i/cos_t
+# (G2's tangent-plane factorization; eta=n_i/n_t).
+#
+# Note on the table row's literal "theta_i->90 deg" phrasing: the valid
+# incidence-angle domain is theta_i in [0,90) only for eta<=1 (n_i<=n_t, no
+# TIR possible) -- for eta>1 the domain is truncated at the critical angle
+# theta_c=asin(1/eta)<90 deg, beyond which cos_t is not real at all. So a
+# literal theta_i->90 limit and a "det diverges" claim can't both hold for
+# the SAME eta: at eta<=1, theta_i really does reach 90 deg, but det->0 (or
+# ->1 exactly, eta=1) there, not infinity; the genuine divergence only
+# happens at eta>1, approaching theta_c (the actual domain edge, which the
+# table's phrasing loosely calls "90 deg"). Same flag-and-proceed discipline
+# as A1's "(1-cos delta)" transcription slip -- both regimes are implemented
+# below so the table row is fully covered rather than silently picking one.
+# The eta>1 divergence rate connects directly to A5: v~sqrt(2u) near the
+# critical angle implies det=eta^2*c/v ~ (eta^2*c_c)/sqrt(2u), a u^(-1/2)
+# pole, not the naive "diverges like 1/u" a bare 1/v pole might suggest.
 # ---------------------------------------------------------------------------
 
-def test_A6() -> StructResult:
-    raise NotImplementedError("A6")
+def test_A6() -> list[StructResult]:
+    import sympy as sp
+    from src.cauchy_ior import cos_theta_t
+    from src.snell_jacobian import solid_angle_ratio
+
+    # --- Check 1: symbolic collapse at theta_i=0, general eta --------------
+    eta_s = sp.symbols("eta", positive=True)
+    # theta_i=0 -> sin2_i=0 -> sin2_t=eta^2*0=0 -> cos_t=1 exactly (Snell).
+    cos_i_0, cos_t_0 = sp.Integer(1), sp.Integer(1)
+    J_par_0  = eta_s * cos_i_0 / cos_t_0
+    J_perp_0 = eta_s
+    collapse_diff = sp.simplify(J_par_0 - J_perp_0)
+
+    # --- Check 2: numeric cross-check against the ACTUAL code at theta_i=0,
+    # several eta values (both <1 and >1).
+    etas = [0.5, 0.67, 1.0, 1.5, 2.0]
+    n_t = 1.0
+    max_collapse_err = 0.0
+    for eta in etas:
+        n_i = eta * n_t
+        cos_i = torch.tensor(1.0)
+        cos_t = cos_theta_t(cos_i, n_i, n_t)
+        J_perp = torch.tensor(eta)
+        J_par = eta * cos_i / cos_t
+        max_collapse_err = max(max_collapse_err, abs(J_par.item() - J_perp.item()) / eta)
+
+    # --- Check 3: eta=1 (matched media) -- det is IDENTICALLY 1 across the
+    # WHOLE domain including theta_i->90, not just at 0 -- no divergence at
+    # all when there's no index contrast, the cleanest possible sanity edge.
+    # theta_i=89.9999 deg is deliberately excluded: cos_theta_t's internal
+    # under=1-sin2_t=1-(1-cos_i^2) is a genuine catastrophic-cancellation
+    # landmine there (cos_i~1.7e-6, so 1-(1-cos_i^2) loses ~4 digits) -- same
+    # numerical family as T13/T15/G1, not a bug, just outside this check's
+    # useful range; 89.999 deg already confirms the identity to 3.7e-8.
+    theta_i = torch.tensor([1.0, 30.0, 60.0, 89.0, 89.9, 89.99, 89.999]) * torch.pi / 180
+    cos_i = torch.cos(theta_i)
+    cos_t_matched = cos_theta_t(cos_i, 1.0, 1.0)
+    det_matched = solid_angle_ratio(torch.tensor(1.0), torch.tensor(1.0), cos_i, cos_t_matched)
+    max_matched_dev = (det_matched - 1.0).abs().max().item()
+
+    # --- Check 4: eta<1 (no TIR possible, domain genuinely reaches 90 deg)
+    # -- det -> 0 as theta_i -> 90, at an exact LINEAR rate in cos_i:
+    # det/cos_i -> eta^2/sqrt(1-eta^2), NOT a divergence. This is the case
+    # the table's literal "theta_i->90" phrasing actually describes without
+    # contradiction (domain reaches 90 for real), but the limit is finite.
+    # The rate is asymptotic (near theta_i=90 only, same caveat as A5's
+    # v/sqrt(2u)) so the check is convergence -- deviation shrinks
+    # monotonically and the final point is near-exact -- not a flat bound
+    # over a range that also includes far-from-grazing angles.
+    eta_sub = 0.625
+    n_i_sub = eta_sub * n_t
+    theta_i_grazing = torch.tensor([80.0, 85.0, 88.0, 89.0, 89.9, 89.99, 89.999, 89.9999]) * torch.pi / 180
+    cos_i_grazing = torch.cos(theta_i_grazing)
+    cos_t_sub = cos_theta_t(cos_i_grazing, n_i_sub, n_t)
+    det_sub = solid_angle_ratio(torch.tensor(n_i_sub), torch.tensor(n_t), cos_i_grazing, cos_t_sub)
+    predicted_rate = eta_sub ** 2 / (1.0 - eta_sub ** 2) ** 0.5
+    rate_dev = (det_sub / cos_i_grazing - predicted_rate).abs()
+    rate_monotone = bool((rate_dev[1:] <= rate_dev[:-1] + 1e-15).all())
+    final_rate_dev = (rate_dev[-1] / predicted_rate).item()
+
+    # --- Check 5: eta>1 (true critical angle theta_c < 90 deg) -- det
+    # DOES diverge, but at theta_i->theta_c (the actual domain edge), not
+    # literal 90 deg, and at rate u^(-1/2) per A5's v~sqrt(2u) result, not a
+    # bare 1/u pole. u := 1 - eta*sin(theta_i) (distance from criticality).
+    eta_sup = 1.6
+    n_i_sup = eta_sup * n_t
+    u_vals = torch.tensor([10.0 ** (-k) for k in range(2, 9)], dtype=torch.float64)
+    sin_i_sup = (1.0 - u_vals) / eta_sup
+    cos_i_sup = torch.sqrt(1.0 - sin_i_sup ** 2)
+    cos_t_sup = cos_theta_t(cos_i_sup, n_i_sup, n_t)
+    det_sup = solid_angle_ratio(torch.tensor(n_i_sup), torch.tensor(n_t), cos_i_sup, cos_t_sup)
+    log_u, log_det = torch.log(u_vals), torch.log(det_sup)
+    slopes = (log_det[1:] - log_det[:-1]) / (log_u[1:] - log_u[:-1])
+    final_slope = slopes[-1].item()
+    slope_converging = bool((slopes[1:] - (-0.5)).abs().max() <= (slopes[:-1] - (-0.5)).abs().max())
+
+    tol = 1e-9
+    return [
+        StructResult("A6", "symbolic: J_par(0) == J_perp(0) == eta exactly, general eta",
+                     0.0 if collapse_diff == 0 else 1.0, 0.0,
+                     0.0 if collapse_diff == 0 else 1.0, 0.0, collapse_diff == 0,
+                     f"sympy.simplify(J_par(0) - J_perp(0)) = {collapse_diff}"),
+        StructResult("A6", "actual code: J_par(0) == J_perp(0) == eta, across eta<1 and eta>1",
+                     max_collapse_err, 0.0, max_collapse_err, tol, max_collapse_err < tol,
+                     f"max relative |J_par(0)-J_perp(0)|/eta over eta in {etas}"),
+        StructResult("A6", "eta=1: det identically 1 across full domain incl. theta_i->90 (no divergence)",
+                     max_matched_dev, 0.0, max_matched_dev, 1e-6, max_matched_dev < 1e-6,
+                     f"max|det-1| over theta_i up to 89.999 deg at matched media"),
+        StructResult("A6", "eta<1: det->0 linearly as theta_i->90 (finite rate, not a divergence)",
+                     final_rate_dev, 0.0, final_rate_dev, 1e-6, rate_monotone and final_rate_dev < 1e-6,
+                     f"eta={eta_sub}: det/cos_i -> {predicted_rate:.6f} = eta^2/sqrt(1-eta^2), "
+                     f"deviation shrinks monotonically, final (theta_i=89.9999 deg) rel dev {final_rate_dev:.2e}"),
+        StructResult("A6", "eta>1: det diverges at theta_i->theta_c like u^(-1/2), matching A5's v~sqrt(2u)",
+                     abs(final_slope - (-0.5)), -0.5, abs(final_slope - (-0.5)), 1e-3,
+                     abs(final_slope - (-0.5)) < 1e-3 and slope_converging,
+                     f"eta={eta_sup}: log-log slope of det vs u -> {final_slope:.6f} "
+                     "(target -0.5, a sqrt pole, not a bare 1/u pole)"),
+    ]
 
 
 # ---------------------------------------------------------------------------
