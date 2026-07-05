@@ -812,10 +812,111 @@ def test_A8() -> list[StructResult]:
 # A9: a_bar -> 0 as sigma_f -> 0
 # Claim (ss9): a_bar = sqrt(2*pi)*alpha0*sigma_f; limit as sigma_f->0 must
 #              vanish at fixed alpha0 -- no spurious finite floor.
+#
+# "No spurious finite floor" is not a strawman: kernel_fluorescence's a(lam')
+# is only ever used as a DISCRETE sum a_bar_discrete = sum(a_j*w_j) over a
+# finite grid (never the closed-form integral directly), and once sigma_f
+# shrinks below the grid spacing, that discrete sum can decouple entirely
+# from the true integral. Same discretization-vs-narrow-Gaussian family as
+# T14's emission-truncation finding, demonstrated here explicitly: if the
+# absorption peak happens to sit near a grid node, the discrete sum
+# PLATEAUS at exactly one cell's quadrature weight (dlam) instead of
+# shrinking to 0 -- a genuine spurious floor, not a rounding artifact.
 # ---------------------------------------------------------------------------
 
-def test_A9() -> StructResult:
-    raise NotImplementedError("A9")
+def test_A9() -> list[StructResult]:
+    import sympy as sp
+
+    alpha0_s, sigma_s, lam_s = sp.symbols("alpha0 sigma lam", positive=True)
+    a_expr = alpha0_s * sp.exp(-lam_s ** 2 / (2 * sigma_s ** 2))
+
+    # Check 1: symbolic closed form, integrated over all reals.
+    a_bar_expr = sp.integrate(a_expr, (lam_s, -sp.oo, sp.oo))
+    target_expr = sp.sqrt(2 * sp.pi) * alpha0_s * sigma_s
+    closed_form_diff = sp.simplify(a_bar_expr - target_expr)
+
+    # Check 2: limit sigma_f -> 0+ is exactly 0 at fixed alpha0 (no floor).
+    limit_at_0 = sp.limit(target_expr, sigma_s, 0, dir="+")
+
+    # Check 3: a_bar is EXACTLY linear in sigma_f with zero intercept --
+    # d(a_bar)/d(sigma_f) is the constant sqrt(2pi)*alpha0, independent of
+    # sigma_f itself (rules out any additive floor term hiding in the form).
+    dabar_dsigma = sp.diff(target_expr, sigma_s)
+    dabar_dsigma_diff = sp.simplify(dabar_dsigma - sp.sqrt(2 * sp.pi) * alpha0_s)
+
+    # --- Numeric: dedicated FINE grid (per T14's caution -- make_grid() is
+    # far too coarse to resolve a narrow Gaussian; build a purpose-fit
+    # uniform grid instead) ---------------------------------------------------
+    alpha0 = 1.0
+    lam_ex = 500.0
+    lam_fine = torch.linspace(400.0, 700.0, 30001, dtype=torch.float64)   # dlam=0.01nm
+    dlam_fine = (lam_fine[1] - lam_fine[0]).item()
+    sigmas_fine = torch.tensor([20.0, 5.0, 1.0, 0.5, 0.1, 0.05], dtype=torch.float64)
+
+    abar_fine, closed_fine = [], []
+    for sigma_f in sigmas_fine.tolist():
+        a = alpha0 * torch.exp(-0.5 * ((lam_fine - lam_ex) / sigma_f) ** 2)
+        abar_fine.append((a * dlam_fine).sum().item())
+        closed_fine.append((2 * torch.pi) ** 0.5 * alpha0 * sigma_f)
+    abar_fine_t = torch.tensor(abar_fine)
+    closed_fine_t = torch.tensor(closed_fine)
+    max_rel_err_fine = ((abar_fine_t - closed_fine_t).abs() / closed_fine_t).max().item()
+    monotone_fine = bool((abar_fine_t[1:] <= abar_fine_t[:-1]).all())
+
+    # --- Numeric: the actual landmine -- COARSE grid (spacing >> sigma_f
+    # eventually), absorption peak deliberately placed ON a grid node (worst
+    # case for the floor artifact) -- discrete sum must plateau at exactly
+    # the single-cell weight dlam_coarse, NOT shrink toward 0. -------------
+    lam_coarse = torch.linspace(400.0, 700.0, 80, dtype=torch.float64)
+    dlam_coarse = (lam_coarse[1] - lam_coarse[0]).item()
+    lam_ex_on_node = lam_coarse[40].item()
+    sigmas_coarse = torch.tensor([0.5, 0.1, 0.01, 0.001], dtype=torch.float64)
+    abar_coarse = []
+    for sigma_f in sigmas_coarse.tolist():
+        a = alpha0 * torch.exp(-0.5 * ((lam_coarse - lam_ex_on_node) / sigma_f) ** 2)
+        abar_coarse.append((a * dlam_coarse).sum().item())
+    floor_err = max(abs(v - dlam_coarse) for v in abar_coarse)
+
+    # --- Numeric: actual kernel_fluorescence code. K.sum() = qy*sum_i(e_i) *
+    # a_bar_discrete, and on this uniform-weight grid sum_i(e_i) = 1/dlam
+    # (since sum_i e_i*w_i=1 normalizes e) -- so a_bar_discrete = K.sum()*dlam
+    # recovers the discrete absorption integral straight from the real
+    # kernel, confirming the actual code path shrinks correctly when the
+    # Gaussian is properly resolved, not just a hand-rolled a*w sum. -------
+    from src.kernels import kernel_fluorescence
+    w_fine = torch.full_like(lam_fine, dlam_fine)
+    code_abar = []
+    for sigma_f in sigmas_fine.tolist():
+        K = kernel_fluorescence(lam_fine, lam_ex, lam_ex + 50.0, sigma_f, w_fine)
+        code_abar.append(K.sum().item() * dlam_fine)
+    code_abar_t = torch.tensor(code_abar)
+    max_code_rel_err = ((code_abar_t - closed_fine_t).abs() / closed_fine_t).max().item()
+
+    tol = 1e-6
+    return [
+        StructResult("A9", "symbolic: integral of Gaussian absorption == sqrt(2pi)*alpha0*sigma_f exactly",
+                     0.0 if closed_form_diff == 0 else 1.0, 0.0,
+                     0.0 if closed_form_diff == 0 else 1.0, 0.0, closed_form_diff == 0,
+                     f"sympy.simplify(integral - target) = {closed_form_diff}"),
+        StructResult("A9", "symbolic: limit sigma_f->0+ is exactly 0 at fixed alpha0",
+                     0.0 if limit_at_0 == 0 else 1.0, 0.0,
+                     0.0 if limit_at_0 == 0 else 1.0, 0.0, limit_at_0 == 0,
+                     f"sympy.limit(a_bar, sigma_f, 0+) = {limit_at_0}"),
+        StructResult("A9", "symbolic: a_bar is exactly linear in sigma_f, zero intercept (no hidden floor)",
+                     0.0 if dabar_dsigma_diff == 0 else 1.0, 0.0,
+                     0.0 if dabar_dsigma_diff == 0 else 1.0, 0.0, dabar_dsigma_diff == 0,
+                     f"d(a_bar)/d(sigma_f) - sqrt(2pi)*alpha0 = {dabar_dsigma_diff} (sigma_f-independent slope)"),
+        StructResult("A9", "fine grid: discrete a_bar tracks closed form and shrinks monotonically to 0",
+                     max_rel_err_fine, 0.0, max_rel_err_fine, tol, max_rel_err_fine < tol and monotone_fine,
+                     f"max rel err vs closed form over sigma_f in {sigmas_fine.tolist()}: {max_rel_err_fine:.2e}"),
+        StructResult("A9", "coarse grid + on-node peak: discrete a_bar PLATEAUS at exactly one cell's weight (real floor)",
+                     floor_err, 0.0, floor_err, 1e-9, floor_err < 1e-9,
+                     f"dlam_coarse={dlam_coarse:.6f}; a_bar_discrete at sigma_f in {sigmas_coarse.tolist()} = "
+                     f"{abar_coarse} -- fails to shrink, confirming the spurious-floor mechanism is real"),
+        StructResult("A9", "actual kernel_fluorescence's a*w term matches closed form when properly resolved",
+                     max_code_rel_err, 0.0, max_code_rel_err, tol, max_code_rel_err < tol,
+                     f"max rel err over sigma_f in {sigmas_fine.tolist()}: {max_code_rel_err:.2e}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
