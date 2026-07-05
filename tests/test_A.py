@@ -923,10 +923,115 @@ def test_A9() -> list[StructResult]:
 # A10: lambda*(A,B) derivatives as kappa-A -> 0
 # Claim (ss13): lambda* -> inf, dlambda*/dA and dlambda*/dB diverge at the
 #               *same rate* relative to lambda*: dlambda*/dA * B / lambda*^3 -> 1/2.
+#
+# Sec13's closed forms: dlambda*/dA=lambda*^3/(2B), dlambda*/dB=lambda*/(2B).
+# The table's "-> 1/2" phrasing undersells what's actually true: since these
+# are EXACT closed forms (not asymptotic approximations), dlambda*/dA*B/lambda*^3
+# equals 1/2 IDENTICALLY for every valid (A,B,kappa), not merely in a
+# kappa-A->0 limit -- same "asymptotic-sounding claim is actually exact"
+# pattern as A2's R(d) parity argument. The genuinely nontrivial content
+# once that's cleared up: dlambda*/dA and dlambda*/dB diverge at DIFFERENT
+# absolute rates as lambda*->inf (cubic vs linear in lambda*) -- so "same
+# rate" can only mean relative to their OWN matching power of lambda*, and
+# strikingly both land on the exact SAME constant 1/(2B):
+#   dlambda*/dA / lambda*^3 = dlambda*/dB / lambda* = 1/(2B), identically.
 # ---------------------------------------------------------------------------
 
-def test_A10() -> StructResult:
-    raise NotImplementedError("A10")
+def test_A10() -> list[StructResult]:
+    import sympy as sp
+    from src.gradient import lambda_star, dlambda_star_dA, dlambda_star_dB
+
+    A_s, B_s, kappa_s = sp.symbols("A B kappa", positive=True)
+    lam_star_expr = sp.sqrt(B_s / (kappa_s - A_s))
+
+    dA_expr = sp.diff(lam_star_expr, A_s)
+    dB_expr = sp.diff(lam_star_expr, B_s)
+    dA_target = lam_star_expr ** 3 / (2 * B_s)
+    dB_target = lam_star_expr / (2 * B_s)
+
+    # Check 1+2: closed forms match sympy's direct differentiation exactly
+    # (Sec13's own "verified exactly" claim, re-derived independently here).
+    dA_diff = sp.simplify(dA_expr - dA_target)
+    dB_diff = sp.simplify(dB_expr - dB_target)
+
+    # Check 3: dlambda*/dA*B/lambda*^3 == 1/2 EXACTLY (identity, not a limit)
+    # -- for general symbolic A,B,kappa, not just as kappa-A->0.
+    ratio_A_expr = sp.simplify(dA_target * B_s / lam_star_expr ** 3)
+    ratio_A_diff = sp.simplify(ratio_A_expr - sp.Rational(1, 2))
+
+    # Check 4: dlambda*/dB*B/lambda* == 1/2 EXACTLY too -- the SAME constant,
+    # against lambda*'s matching (linear, not cubic) power this time.
+    ratio_B_expr = sp.simplify(dB_target * B_s / lam_star_expr)
+    ratio_B_diff = sp.simplify(ratio_B_expr - sp.Rational(1, 2))
+
+    # Check 5: NOT the same absolute divergence rate -- dlambda*/dA grows
+    # like lambda*^3, dlambda*/dB grows only like lambda*, so their RATIO
+    # itself diverges as lambda*->inf (cubic/linear = lambda*^2 -> inf).
+    ratio_dA_dB = sp.simplify(dA_target / dB_target)
+    ratio_dA_dB_is_lamsq = sp.simplify(ratio_dA_dB - lam_star_expr ** 2)
+
+    # --- Numeric: actual lambda_star/dlambda_star_dA/dB code, kappa-A -> 0 --
+    B_num = 8000.0
+    A_num = 1.5
+    gaps = torch.tensor([1.0, 0.1, 0.01, 0.001, 1e-4, 1e-5], dtype=torch.float64)
+    kappas = A_num + gaps
+    sin_i_vals = 1.0 / kappas
+    cos_i_vals = torch.sqrt(1.0 - sin_i_vals ** 2)
+
+    lam_stars, dA_vals, dB_vals = [], [], []
+    for cos_i in cos_i_vals.tolist():
+        ls = lambda_star(A_num, B_num, torch.tensor(cos_i))
+        lam_stars.append(ls.item())
+        dA_vals.append(dlambda_star_dA(ls, B_num).item())
+        dB_vals.append(dlambda_star_dB(ls, B_num).item())
+    lam_stars_t = torch.tensor(lam_stars)
+    dA_vals_t, dB_vals_t = torch.tensor(dA_vals), torch.tensor(dB_vals)
+
+    # Check 6: lambda* -> inf as kappa-A -> 0, strictly increasing.
+    lam_star_diverges = bool((lam_stars_t[1:] > lam_stars_t[:-1]).all())
+
+    # Check 7: both normalized ratios equal 1/(2B) exactly, at every gap --
+    # confirms the exact-identity claim numerically against the real code.
+    target_const = 1.0 / (2.0 * B_num)
+    ratio_A_code = dA_vals_t * B_num / lam_stars_t ** 3
+    ratio_B_code = dB_vals_t * B_num / lam_stars_t
+    max_ratio_err = max((ratio_A_code - 0.5).abs().max().item(),
+                         (ratio_B_code - 0.5).abs().max().item())
+
+    # Check 8: dA/dB ratio grows like lambda*^2, confirming the different
+    # absolute divergence rates (cubic vs linear) numerically.
+    dAdB_ratio = dA_vals_t / dB_vals_t
+    max_rel_err_dAdB = ((dAdB_ratio - lam_stars_t ** 2).abs() / lam_stars_t ** 2).max().item()
+
+    tol = 1e-10
+    return [
+        StructResult("A10", "symbolic: dlambda*/dA and dlambda*/dB match sympy's direct differentiation",
+                     0.0 if (dA_diff == 0 and dB_diff == 0) else 1.0, 0.0,
+                     0.0 if (dA_diff == 0 and dB_diff == 0) else 1.0, 0.0,
+                     dA_diff == 0 and dB_diff == 0,
+                     f"sympy.simplify(dA-target) = {dA_diff}, sympy.simplify(dB-target) = {dB_diff}"),
+        StructResult("A10", "symbolic: dlambda*/dA*B/lambda*^3 == 1/2 EXACTLY (identity, not just a limit)",
+                     0.0 if ratio_A_diff == 0 else 1.0, 0.0,
+                     0.0 if ratio_A_diff == 0 else 1.0, 0.0, ratio_A_diff == 0,
+                     f"sympy.simplify(ratio_A - 1/2) = {ratio_A_diff}"),
+        StructResult("A10", "symbolic: dlambda*/dB*B/lambda* == 1/2 EXACTLY too (same constant)",
+                     0.0 if ratio_B_diff == 0 else 1.0, 0.0,
+                     0.0 if ratio_B_diff == 0 else 1.0, 0.0, ratio_B_diff == 0,
+                     f"sympy.simplify(ratio_B - 1/2) = {ratio_B_diff}"),
+        StructResult("A10", "symbolic: dA/dB ratio == lambda*^2 exactly (different absolute divergence rates)",
+                     0.0 if ratio_dA_dB_is_lamsq == 0 else 1.0, 0.0,
+                     0.0 if ratio_dA_dB_is_lamsq == 0 else 1.0, 0.0, ratio_dA_dB_is_lamsq == 0,
+                     f"sympy.simplify((dA/dB) - lambda*^2) = {ratio_dA_dB_is_lamsq}"),
+        StructResult("A10", "actual code: lambda* -> inf strictly as kappa-A -> 0",
+                     float(not lam_star_diverges), 0.0, float(not lam_star_diverges), 0.0, lam_star_diverges,
+                     f"lambda* over kappa-A gaps {gaps.tolist()}: {lam_stars}"),
+        StructResult("A10", "actual code: both normalized ratios == 1/(2B) exactly at every gap",
+                     max_ratio_err, 0.0, max_ratio_err, tol, max_ratio_err < tol,
+                     f"1/(2B)={target_const:.3e}; max|ratio-1/2| = {max_ratio_err:.2e} over both dA,dB forms"),
+        StructResult("A10", "actual code: dA/dB grows like lambda*^2, confirming cubic-vs-linear rates",
+                     max_rel_err_dAdB, 0.0, max_rel_err_dAdB, tol, max_rel_err_dAdB < tol,
+                     f"max rel err of (dA/dB)/lambda*^2 - 1: {max_rel_err_dAdB:.2e}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
