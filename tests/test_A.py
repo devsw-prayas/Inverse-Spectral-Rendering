@@ -646,10 +646,79 @@ def test_A6() -> list[StructResult]:
 # A7: J_TIR collapse at eta=1
 # Claim (ss7): J_TIR^s(v=0) = 4*eta and J_TIR^p(v=0) = 4*eta^3 both equal 4
 #              when eta=1 (no interface, no TIR, polarizations must agree).
+#
+# Theorem 3 (Sec7): J_TIR^s(v)=4eta^3c^2/(eta*c+v)^2, J_TIR^p(v)=4eta^3c^2/(c+eta*v)^2.
+# At v=0: J_TIR^s(0)=4eta^3c^2/(eta*c)^2=4eta, J_TIR^p(0)=4eta^3c^2/c^2=4eta^3 --
+# both independent of c (matches Sec7's own "nonzero denominator at v=0" note).
+# At eta=1 (matched media, s and p Fresnel coefficients are identical, so
+# there is exactly one physical answer, not two): both collapse to 4.
 # ---------------------------------------------------------------------------
 
-def test_A7() -> StructResult:
-    raise NotImplementedError("A7")
+def test_A7() -> list[StructResult]:
+    import sympy as sp
+    from src.snell_jacobian import tir_jacobian
+
+    eta_s, c_s, v_s = sp.symbols("eta c v", positive=True)
+    J_s = 4 * eta_s ** 3 * c_s ** 2 / (eta_s * c_s + v_s) ** 2
+    J_p = 4 * eta_s ** 3 * c_s ** 2 / (c_s + eta_s * v_s) ** 2
+
+    # Check 1: symbolic limit v->0, general eta,c -- must be 4*eta and 4*eta^3
+    # respectively, with the c-dependence cancelling out completely.
+    Js0 = sp.simplify(sp.limit(J_s, v_s, 0))
+    Jp0 = sp.simplify(sp.limit(J_p, v_s, 0))
+    s_diff = sp.simplify(Js0 - 4 * eta_s)
+    p_diff = sp.simplify(Jp0 - 4 * eta_s ** 3)
+
+    # Check 2: at eta=1, both v=0 limits collapse to exactly 4, general c.
+    Js0_eta1 = sp.simplify(Js0.subs(eta_s, 1))
+    Jp0_eta1 = sp.simplify(Jp0.subs(eta_s, 1))
+    collapse_diff = sp.simplify(Js0_eta1 - Jp0_eta1)
+    collapse_val_diff = sp.simplify(Js0_eta1 - 4)
+
+    # Check 3: NOT vacuous -- away from eta=1, s and p limits genuinely
+    # differ (4*eta != 4*eta^3 unless eta in {0,1,-1}).
+    eta_away = sp.Rational(3, 2)
+    away_diff = float(sp.simplify((4 * eta_away) - (4 * eta_away ** 3)))
+
+    # Check 4: actual tir_jacobian() code, v=0, sweep of eta including 1.0,
+    # confirms J_s(0)=4*eta, J_p(0)=4*eta^3 numerically, and that they agree
+    # only at eta=1 among the tested values.
+    etas = torch.tensor([0.5, 0.8, 1.0, 1.3, 2.0], dtype=torch.float64)
+    cos_i = torch.full_like(etas, 0.6)
+    v0 = torch.zeros_like(etas)
+    J_s_code = tir_jacobian(v0, etas, torch.ones_like(etas), cos_i, polarization="s")
+    J_p_code = tir_jacobian(v0, etas, torch.ones_like(etas), cos_i, polarization="p")
+    max_s_err = (J_s_code - 4 * etas).abs().max().item()
+    max_p_err = (J_p_code - 4 * etas ** 3).abs().max().item()
+    eta1_idx = 2
+    collapse_err_code = abs(J_s_code[eta1_idx].item() - J_p_code[eta1_idx].item())
+    other_idx_diffs = [(J_s_code[i] - J_p_code[i]).abs().item() for i in range(len(etas)) if i != eta1_idx]
+
+    tol = 1e-12
+    return [
+        StructResult("A7", "symbolic: J_TIR^s(0)=4*eta and J_TIR^p(0)=4*eta^3 exactly, general eta,c",
+                     0.0 if (s_diff == 0 and p_diff == 0) else 1.0, 0.0,
+                     0.0 if (s_diff == 0 and p_diff == 0) else 1.0, 0.0,
+                     s_diff == 0 and p_diff == 0,
+                     f"sympy.limit(J_s,v,0)-4eta = {s_diff}, sympy.limit(J_p,v,0)-4eta^3 = {p_diff} "
+                     "(both independent of c, matching Sec7's nonzero-denominator note)"),
+        StructResult("A7", "symbolic: at eta=1, J_TIR^s(0)=J_TIR^p(0)=4 exactly",
+                     0.0 if (collapse_diff == 0 and collapse_val_diff == 0) else 1.0, 0.0,
+                     0.0 if (collapse_diff == 0 and collapse_val_diff == 0) else 1.0, 0.0,
+                     collapse_diff == 0 and collapse_val_diff == 0,
+                     f"J_s(0)-J_p(0) at eta=1: {collapse_diff}; J_s(0)-4 at eta=1: {collapse_val_diff}"),
+        StructResult("A7", "symbolic: NOT vacuous -- s,p limits genuinely differ away from eta=1",
+                     abs(away_diff), None, None, 1e-9, abs(away_diff) > 1e-9,
+                     f"4*eta - 4*eta^3 at eta=3/2: {away_diff:.4f} (nonzero -- collapse is specific to eta=1)"),
+        StructResult("A7", "actual tir_jacobian() code: J_s(0)=4*eta, J_p(0)=4*eta^3 for all tested eta",
+                     max(max_s_err, max_p_err), 0.0, max(max_s_err, max_p_err), tol,
+                     max_s_err < tol and max_p_err < tol,
+                     f"max|J_s(0)-4eta| = {max_s_err:.2e}, max|J_p(0)-4eta^3| = {max_p_err:.2e} over eta in {etas.tolist()}"),
+        StructResult("A7", "actual tir_jacobian() code: s,p agree ONLY at eta=1 among tested values",
+                     collapse_err_code, 0.0, collapse_err_code, tol,
+                     collapse_err_code < tol and all(d > 1e-3 for d in other_idx_diffs),
+                     f"|J_s(0)-J_p(0)| at eta=1: {collapse_err_code:.2e}; at other etas: {other_idx_diffs}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
