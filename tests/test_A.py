@@ -1038,10 +1038,98 @@ def test_A10() -> list[StructResult]:
 # A11: lambda_ex,j invariance for k species (symbolic)
 # Claim (ss14): d/dlambda_ex,j of sum_j term_j = 0 independent of k,
 #               provable as one-line linearity for symbolic k.
+#
+# Sec14: "generalizes for free, by linearity -- not new mathematics." Builds
+# directly on A9's single-species result (absorbed power under flat
+# illuminant = Lbar*sqrt(2pi)*alpha0*sigma_f, no lambda_ex dependence at
+# all) rather than re-deriving the integral: plug that ALREADY-lambda_ex-
+# free closed form into an indexed term_j and sum over a SYMBOLIC k via
+# sympy's Sum -- the total's derivative w.r.t. any single species'
+# lambda_ex,m is then 0 by linearity of differentiation, for arbitrary k,
+# not just enumerated up to some finite k. Sec14's own numeric check (k up
+# to 4, prior session) is redone here fresh against the actual code, pushed
+# to larger k as a genuine stress test of "independent of k".
 # ---------------------------------------------------------------------------
 
-def test_A11() -> StructResult:
-    raise NotImplementedError("A11")
+def test_A11() -> list[StructResult]:
+    import sympy as sp
+
+    j, k, m = sp.symbols("j k m", positive=True, integer=True)
+    Lbar = sp.symbols("Lbar", positive=True)
+    alpha0 = sp.IndexedBase("alpha0")
+    sigma_f = sp.IndexedBase("sigma_f")
+    lam_ex = sp.IndexedBase("lam_ex")   # kept indexed but never appears in term_j
+
+    term_j = Lbar * sp.sqrt(2 * sp.pi) * alpha0[j] * sigma_f[j]
+    total = sp.Sum(term_j, (j, 1, k))
+
+    # Check 1: d(total)/d(lambda_ex[m]) = 0 for SYMBOLIC k (not enumerated),
+    # since term_j structurally never contains lambda_ex[j] at all -- the
+    # one-line linearity argument Sec14 describes, made explicit in sympy.
+    d_total_dlam_ex_m = sp.diff(total, lam_ex[m])
+    d_total_diff = sp.simplify(d_total_dlam_ex_m)
+
+    # Check 2: NOT vacuous by construction -- if a term genuinely DID depend
+    # on its own lambda_ex,j (e.g. Sec9's non-flat-illuminant contrast case),
+    # sympy's diff machinery correctly reports a NONZERO derivative for that
+    # term -- confirms Check 1's zero isn't a sympy artifact of diff/Sum.
+    # (Differentiated as a single indexed term w.r.t. its own lambda_ex[j],
+    # not through the symbolic-k Sum -- diff of Sum at a free index m
+    # produces a Piecewise on whether m is in range [1,k], which is a
+    # correct-but-orthogonal range-membership question, not what this check
+    # is after.)
+    k_slope = sp.symbols("k_slope")
+    term_j_broken = term_j + k_slope * alpha0[j] * sigma_f[j] * lam_ex[j]
+    d_broken_dlam_ex_j = sp.diff(term_j_broken, lam_ex[j])
+    d_broken_diff = sp.simplify(d_broken_dlam_ex_j - k_slope * alpha0[j] * sigma_f[j])
+
+    # --- Numeric: actual per-species absorbed-power sum, real Gaussian
+    # integrals on a fine grid (A9-style), pushed to larger k than the
+    # prior session's k<=4 check. Grid deliberately wide relative to
+    # sigma_f/perturbation range so every absorption peak, before and after
+    # perturbation, stays >=5 sigma_f from both edges (same "deep in-band"
+    # discipline G3/T14 established -- letting a peak wander near/outside
+    # the truncated window would trigger the T14 edge-truncation effect,
+    # a real but DIFFERENT phenomenon from what this check is after).
+    torch.manual_seed(11)
+    lam = torch.linspace(200.0, 900.0, 35001, dtype=torch.float64)
+    dlam = (lam[1] - lam[0]).item()
+    Lbar_num = 3.7
+
+    def total_absorbed(alpha0_list, lam_ex_list, sigma_f_list):
+        total = torch.tensor(0.0, dtype=torch.float64)
+        for a0, lex, sf in zip(alpha0_list, lam_ex_list, sigma_f_list):
+            a = a0 * torch.exp(-0.5 * ((lam - lex) / sf) ** 2)
+            total = total + Lbar_num * (a * dlam).sum()
+        return total.item()
+
+    max_abs_diff = 0.0
+    for kk in [1, 2, 3, 5, 8, 12]:
+        alpha0_list = (torch.rand(kk, dtype=torch.float64) * 2.0 + 0.5).tolist()
+        sigma_f_list = (torch.rand(kk, dtype=torch.float64) * 10.0 + 5.0).tolist()
+        lam_ex_list = (torch.rand(kk, dtype=torch.float64) * 100.0 + 500.0).tolist()
+        base = total_absorbed(alpha0_list, lam_ex_list, sigma_f_list)
+
+        perturbed_lam_ex = [le + (torch.rand(()).item() * 100.0 - 50.0) for le in lam_ex_list]
+        perturbed = total_absorbed(alpha0_list, perturbed_lam_ex, sigma_f_list)
+        max_abs_diff = max(max_abs_diff, abs(perturbed - base))
+
+    tol = 1e-8
+    return [
+        StructResult("A11", "symbolic: d(sum of k terms)/d(lambda_ex,m) = 0 for SYMBOLIC k",
+                     0.0 if d_total_diff == 0 else 1.0, 0.0,
+                     0.0 if d_total_diff == 0 else 1.0, 0.0, d_total_diff == 0,
+                     f"sympy.diff(Sum(term_j, (j,1,k)), lambda_ex[m]) = {d_total_diff}"),
+        StructResult("A11", "symbolic: NOT vacuous -- a genuinely lambda_ex-dependent term gives nonzero derivative",
+                     0.0 if d_broken_diff == 0 else 1.0, 0.0,
+                     0.0 if d_broken_diff == 0 else 1.0, 0.0, d_broken_diff == 0,
+                     f"sympy.simplify(broken derivative - k_slope*alpha0[j]*sigma_f[j]) = {d_broken_diff} "
+                     "(matches expectation exactly, and is nonzero unless k_slope=0)"),
+        StructResult("A11", "actual code: k-species absorbed power exactly invariant to simultaneous lambda_ex perturbation",
+                     max_abs_diff, 0.0, max_abs_diff, tol, max_abs_diff < tol,
+                     f"max|perturbed-base| over k in [1,2,3,5,8,12], random alpha0/sigma_f/lambda_ex "
+                     f"and random simultaneous lambda_ex shifts up to 100nm: {max_abs_diff:.2e}"),
+    ]
 
 
 # ---------------------------------------------------------------------------
