@@ -510,10 +510,105 @@ def test_V5() -> list[StructResult]:
 #        mismatched forward model.
 # Claim: recovery quality must degrade under mismatch -- else the "successful"
 #        recovery was partly circular.
+#
+# Mismatch axis: bounce depth D. scenes.py's docstrings already treat
+# max_depth as a first-class, deliberate model axis ("bounce depth D --
+# configurable axis per spec Sec6.1"), and V2 already showed depth genuinely
+# changes the physics (multi-bounce fluorescent re-absorption). So: generate
+# "true" data with the correct, converged multi-bounce two_bounce() (depth
+# high enough to be at the fixed point), then recover with an assumed model
+# that WRONGLY truncates bounce depth -- a real, physically motivated
+# inverse crime (fitting a single/few-scatter model to multi-scatter data),
+# not an arbitrary synthetic perturbation.
+#
+# Falsifier: reduced chi-square (post-fit loss / ((M-P) sigma^2)) is the
+# standard diagnostic -- ~1 under a correctly matched model plus noise (this
+# is V5 Panel B's own regime), and >>1 under structural misspecification
+# that noise-rescaling cannot explain. Checked to be monotonic in mismatch
+# severity (assumed depth closer to the true depth -> better fit), not just
+# a single before/after number.
 # ---------------------------------------------------------------------------
 
-def test_V6() -> StructResult:
-    raise NotImplementedError("V6")
+def test_V6() -> list[StructResult]:
+    from src.spectral_grid import SpectralGrid
+    from src.scenes import two_bounce
+    from src.sensor import hyperspectral_fx10
+    from src.gradient import levenberg_marquardt
+
+    N = 300
+    lam = torch.linspace(400.0, 700.0, N, dtype=torch.float64)
+    dlam = (lam[1] - lam[0]).item()
+    grid = SpectralGrid(nu_tilde=torch.zeros(N, dtype=torch.float64), lam=lam,
+                         weights=torch.full_like(lam, dlam), N=N, d_nu=dlam)
+    sensor = hyperspectral_fx10(lam, M=20)
+    L_e = torch.full_like(lam, 4.2)
+
+    cos_i, lam_ex, qy = 1.0, 450.0, 0.8
+    theta_true = torch.tensor([120.0, 1.5, 5000.0, 30.0, 550.0])   # d, A, B, sigma_f, lam_em
+    P = theta_true.numel()
+    M = sensor.M
+    dof = M - P
+    noise_sigma = 3e-4
+    n_seeds = 15
+    true_depth = 32   # converged multi-bounce -- the actual physical process
+
+    def render(theta, depth):
+        d, A, B, sf, lem = theta[0], theta[1], theta[2], theta[3], theta[4]
+        return two_bounce(grid, sensor, d=d, A=A, B=B, cos_i=cos_i, lam_ex=lam_ex,
+                           lam_em=lem, sigma_f=sf, quantum_yield=qy, L_e=L_e,
+                           max_depth=depth).image
+
+    img_true = render(theta_true, true_depth).detach()
+
+    assumed_depths = [1, 4, 8, true_depth]
+    reduced_chi2: dict[int, float] = {}
+    mean_bias: dict[int, torch.Tensor] = {}
+    for assumed_depth in assumed_depths:
+        torch.manual_seed(99)
+        chi2s, biases = [], []
+        for _ in range(n_seeds):
+            img_noisy = img_true + torch.randn(M) * noise_sigma
+            def residual_fn(theta, img_noisy=img_noisy, depth=assumed_depth):
+                return render(theta, depth) - img_noisy
+            theta_hat, loss, _ = levenberg_marquardt(residual_fn, theta_true.clone())
+            chi2s.append(loss / (dof * noise_sigma ** 2))
+            biases.append((theta_hat - theta_true).abs())
+        reduced_chi2[assumed_depth] = torch.tensor(chi2s).mean().item()
+        mean_bias[assumed_depth] = torch.stack(biases).mean(dim=0)
+
+    tol = 0.5
+    results: list[StructResult] = []
+    results.append(StructResult(
+        "V6", f"matched model (depth={true_depth}, the true generating depth): reduced chi^2 ~ 1",
+        reduced_chi2[true_depth], 1.0, abs(reduced_chi2[true_depth] - 1.0), 3.0,
+        abs(reduced_chi2[true_depth] - 1.0) < 3.0,
+        "consistent with pure measurement noise, no structural misfit -- this is V5 Panel B's own regime"))
+    results.append(StructResult(
+        "V6", "maximally mismatched model (depth=1 vs true depth=32): reduced chi^2 >> 1",
+        reduced_chi2[1], None, None, 100.0, reduced_chi2[1] > 100.0,
+        f"reduced chi^2 = {reduced_chi2[1]:.3e} -- structural misfit that noise rescaling cannot explain, "
+        "confirms V5's recovery success was not an inverse crime"))
+    chi2_seq = [reduced_chi2[d] for d in assumed_depths]
+    # 20% relative slack: the true model converges by depth~8 (see V2), so the
+    # depth=8 vs depth=32 pair is a physically-identical plateau and only
+    # differs by LM/seed noise -- a strict decrease there would be a false
+    # positive, not a real monotonicity violation.
+    monotone = all(chi2_seq[i] > chi2_seq[i + 1] * 0.8 for i in range(len(chi2_seq) - 1))
+    results.append(StructResult(
+        "V6", "NOT vacuous: reduced chi^2 decreases monotonically as assumed depth -> true depth",
+        float(monotone), 1.0, float(not monotone), 0.0, monotone,
+        "reduced chi^2 by assumed depth: " + " ".join(f"{d}:{reduced_chi2[d]:.3e}" for d in assumed_depths)))
+
+    worst_param = int(mean_bias[1].argmax().item())
+    names = ["d", "A", "B", "sigma_f", "lam_em"]
+    bias_ratio = (mean_bias[1][worst_param] / mean_bias[true_depth][worst_param].clamp(min=1e-30)).item()
+    results.append(StructResult(
+        "V6", f"mismatched-model parameter bias ({names[worst_param]}) is much larger than matched-model bias",
+        bias_ratio, None, None, 10.0, bias_ratio > 10.0,
+        f"mean|bias| at depth=1: {mean_bias[1][worst_param]:.4g}  at depth={true_depth}: "
+        f"{mean_bias[true_depth][worst_param]:.4g} -- {bias_ratio:.1f}x worse under mismatch"))
+
+    return results
 
 
 # ---------------------------------------------------------------------------

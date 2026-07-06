@@ -356,7 +356,13 @@ def levenberg_marquardt(
                 lam *= 10.0
                 continue
             theta_new = theta + delta
-            loss_new = residual_fn(theta_new).detach().pow(2).sum().item()
+            try:
+                loss_new = residual_fn(theta_new).detach().pow(2).sum().item()
+            except ValueError:
+                # Trial step landed outside the physically valid region
+                # (e.g. H_wp violated) -- treat exactly like a rejected step.
+                lam *= 10.0
+                continue
             if loss_new < loss:
                 theta, loss = theta_new, loss_new
                 lam = max(lam / 10.0, 1e-12)
