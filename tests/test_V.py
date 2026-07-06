@@ -629,10 +629,108 @@ def test_V7() -> list[StructResult]:
 #        ratios, actually rendered.
 # Claim: oversampled-lambda reference render vs production sampling rate;
 #        any spurious beat pattern in the rendered image is a failure.
+#
+# G8 already checked this at the Jacobian-conditioning level (negative
+# result: no dominant FSR-locked periodicity). This promotes it to the
+# render level per the table's own distinction: does an actual rendered
+# sensor image at make_grid()'s production oversampling diverge from a much
+# finer reference, in a way that beats against the fringe period as d sweeps?
+#
+# Landmine hit and fixed: Sensor.measure() (raw S@L, no dlam factor) is NOT
+# resolution-invariant -- comparing images built on two different-density
+# grids directly is comparing unlike quantities (the raw sum scales with
+# how many grid points fall in a sensor band). Same footgun as the V9
+# exploration. Fixed by weighting with the grid's own quadrature weights
+# before measuring (S @ (R * grid.weights)), approximating the same
+# continuum integral regardless of grid density.
 # ---------------------------------------------------------------------------
 
-def test_V8() -> StructResult:
-    raise NotImplementedError("V8")
+def test_V8() -> list[StructResult]:
+    from src.spectral_grid import make_grid
+    from src.kernels import fabry_airy_R
+    from src.sensor import hyperspectral_fx10
+
+    cos_i = torch.tensor(1.0, dtype=torch.float64)
+    A0, B0 = 1.5, 5000.0
+    lam_c = 550.0
+    n_ref = A0 + B0 / lam_c ** 2
+    d_fringe = lam_c / (2.0 * n_ref)   # G8's own d-domain fringe period at lam_c
+
+    n_periods = 16
+    d0 = 300.0
+    span = n_periods * d_fringe
+    d_max_sweep = d0 + span
+    lam_min, lam_max = 450.0, 650.0
+
+    def image(d, grid, sensor):
+        R = fabry_airy_R(grid.lam, cos_i, d, A0, B0, "unpolarized")
+        return sensor.measure(R * grid.weights)
+
+    grid_fine = make_grid(lam_min, lam_max, A0, B0, d_max=d_max_sweep, oversampling=32.0)
+    sensor_fine = hyperspectral_fx10(grid_fine.lam, M=6)
+
+    N = 300
+    d_sweep = torch.linspace(d0, d_max_sweep, N, dtype=torch.float64)
+    img_fine = [image(d_sweep[i].item(), grid_fine, sensor_fine) for i in range(N)]
+
+    def err_curve(oversampling: float) -> torch.Tensor:
+        grid_p = make_grid(lam_min, lam_max, A0, B0, d_max=d_max_sweep, oversampling=oversampling)
+        sensor_p = hyperspectral_fx10(grid_p.lam, M=6)
+        errs = torch.zeros(N, dtype=torch.float64)
+        for i in range(N):
+            img_p = image(d_sweep[i].item(), grid_p, sensor_p)
+            errs[i] = (img_fine[i] - img_p).norm() / img_fine[i].norm().clamp(min=1e-30)
+        return errs
+
+    err_prod = err_curve(4.0)    # make_grid's own default oversampling
+    err_bad = err_curve(0.25)    # deliberately well below Nyquist
+
+    results: list[StructResult] = []
+    results.append(StructResult(
+        "V8", "production oversampling (4.0, make_grid's own default): max relative image error across 16 FSR periods",
+        err_prod.max().item(), 0.0, err_prod.max().item(), 0.01, err_prod.max().item() < 0.01,
+        f"mean={err_prod.mean().item():.4f}  max={err_prod.max().item():.4f} over N={N} points, "
+        "no aliasing hot-spot anywhere in the sweep"))
+    results.append(StructResult(
+        "V8", "NOT vacuous: deliberately undersampled grid (oversampling=0.25) shows a large, clearly detectable error",
+        err_bad.mean().item(), None, None, 0.3, err_bad.mean().item() > 0.3,
+        f"mean={err_bad.mean().item():.3f} -- confirms the comparison has teeth (violating the Nyquist "
+        "safety margin is actually detected), not just insensitive to everything"))
+
+    means = []
+    for ov in (4.0, 2.0, 1.0, 0.5, 0.25):
+        means.append(err_curve(ov).mean().item())
+    monotone = all(means[i] < means[i + 1] for i in range(len(means) - 1))
+    results.append(StructResult(
+        "V8", "mean image error increases monotonically as oversampling decreases (genuine sampling-density effect, not noise)",
+        float(monotone), 1.0, float(not monotone), 0.0, monotone,
+        "mean err by oversampling [4,2,1,0.5,0.25]: " + " ".join(f"{m:.4f}" for m in means)))
+
+    def detrend(y: torch.Tensor) -> torch.Tensor:
+        x = torch.linspace(0.0, 1.0, N, dtype=torch.float64)
+        X = torch.stack([torch.ones(N, dtype=torch.float64), x], dim=1)
+        beta = torch.linalg.lstsq(X, y.unsqueeze(1)).solution.squeeze()
+        return y - X @ beta
+
+    def r2_at_period(detr: torch.Tensor, period: float) -> float:
+        theta = 2.0 * torch.pi * d_sweep / period
+        Xs = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
+        b = torch.linalg.lstsq(Xs, detr.unsqueeze(1)).solution.squeeze()
+        ss_res = ((detr - Xs @ b) ** 2).sum().item()
+        total_var = (detr ** 2).sum().item()
+        return 1.0 - ss_res / total_var
+
+    r2_prod = r2_at_period(detrend(err_prod), d_fringe)
+    r2_bad = r2_at_period(detrend(err_bad), d_fringe)
+    tol_periodic = 0.3
+    results.append(StructResult(
+        "V8", "even at maximal mismatch, image error is not dominated by a single tone at the FSR fundamental "
+        "(same negative result as G8, now at the render level)",
+        max(r2_prod, r2_bad), 0.0, max(r2_prod, r2_bad), tol_periodic, max(r2_prod, r2_bad) < tol_periodic,
+        f"R^2 at d_fringe={d_fringe:.2f}nm: production={r2_prod:.3f}, undersampled={r2_bad:.3f} -- "
+        "the large undersampled error is a broad-spectrum discrepancy, not a clean single-frequency beat"))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -641,10 +739,45 @@ def test_V8() -> StructResult:
 #        escaping past TIR-bounded interface, lambda* swept through emission band.
 # Claim: FD on full re-render at A +/- eps -- the explicit named falsifier
 #        from the project's own list.
+#
+# DEFERRED (2026-07-06) -- genuinely open theoretical question, not a routine
+# scene-promotion, discussed with the user before stopping. Sec13's locked
+# moving-boundary lemma (-e(lambda*)*dlambda*/dtheta) is derived for a bare
+# single integral with a BOUNDED integrand at the moving endpoint (T12/G3's
+# own setup). Promoting it to "full scene complexity" hits three compounding
+# issues, discovered in order:
+#   1. TIR channels don't converge under truncated Neumann bounces (radiance
+#      grows linearly with bounce depth there -- V1's own finding). Fixable:
+#      restrict the solve to the propagating-only index set and use the
+#      exact (infinite-bounce) linear solve there, matching V1 Check 5/6's
+#      precedent that this subset is well-posed even as R -> 1.
+#   2. A raw/unweighted sum over L is NOT grid-resolution-invariant (diverges
+#      as the grid is refined) -- the physically correct aggregate is the
+#      quadrature-weighted integral (L*weights).sum(), matching how
+#      kernel_fluorescence already bakes weights into its own column
+#      contraction. Fixable, and fixed once identified.
+#   3. NOT fixable by a quick patch: near the moving critical wavelength,
+#      radiance itself diverges as 1/sqrt(lambda-lambda*) (derived from the
+#      Fresnel near-critical expansion 1-R ~ sqrt(lambda-lambda*)) -- an
+#      INTEGRABLE singularity sitting exactly at the boundary the Leibniz
+#      term is supposed to describe. The classical boundary-term formula
+#      assumes the integrand is bounded there; this integrand is not. A
+#      correct term would need a substitution-based treatment (the same
+#      flavor of trick Theorem 3 used for the TIR Jacobian via v=cos(theta_t),
+#      not yet worked out for this specific singular integrand).
+#
+# This is the same category as A12/A13 (open theoretical question requiring
+# real derivation), not "formalize an already-locked result" like every other
+# V-series test. Queued alongside A12/A13 for a dedicated derivation session
+# rather than resolved unilaterally here.
 # ---------------------------------------------------------------------------
 
 def test_V9() -> GradResult:
-    raise NotImplementedError("V9")
+    raise NotImplementedError(
+        "V9 -- open theoretical question (moving-boundary Leibniz term for a "
+        "singular integrand at the boundary itself), see comment above. "
+        "Queued alongside A12/A13, not deferred to Phase 2."
+    )
 
 
 # ---------------------------------------------------------------------------
