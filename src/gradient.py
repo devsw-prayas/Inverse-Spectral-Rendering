@@ -309,3 +309,62 @@ def moving_boundary_grad(
     profile evaluated at λ*; dlam_star_dtheta from dlambda_star_dA/dB.
     """
     return -e_at_star * dlam_star_dtheta
+
+
+# ---------------------------------------------------------------------------
+# Levenberg-Marquardt recovery (V5, V6) — nonlinear least-squares over a
+# differentiable forward model, using the same Jacobian machinery the
+# G/T-series conditioning tests already build.
+# ---------------------------------------------------------------------------
+
+def levenberg_marquardt(
+    residual_fn: "callable[[torch.Tensor], torch.Tensor]",
+    theta0:      torch.Tensor,
+    max_iter:    int = 80,
+    lam_init:    float = 1e-3,
+    tol:         float = 1e-14,
+) -> tuple[torch.Tensor, float, int]:
+    """Marquardt-damped Gauss-Newton: minimize ||residual_fn(theta)||^2.
+
+    Marquardt scaling (J^T J + lam * diag(J^T J)) delta = -J^T r — the
+    diag(J^T J) damping (rather than plain lam*I) keeps steps well-scaled
+    when parameters span very different physical units (e.g. d ~ 1e2 nm vs
+    B ~ 1e3 nm^2), without any manual per-parameter normalization.
+
+    residual_fn: theta (P,) -> residual (M,), differentiable.
+    theta0:      (P,) initial guess.
+    Returns (theta_hat (P,) detached, final loss, iterations used).
+    """
+    theta = theta0.clone().detach()
+    lam = lam_init
+    loss = residual_fn(theta).detach().pow(2).sum().item()
+    delta = torch.zeros_like(theta)
+    it = 0
+    for it in range(max_iter):
+        theta_req = theta.clone().requires_grad_(True)
+        J = torch.autograd.functional.jacobian(residual_fn, theta_req).detach()
+        r = residual_fn(theta_req).detach()
+        JTJ = J.T @ J
+        JTr = J.T @ r
+        diag_JTJ = torch.diag(JTJ).clamp(min=1e-30)
+        accepted = False
+        for _ in range(40):
+            A_damped = JTJ + lam * torch.diag(diag_JTJ)
+            try:
+                delta = torch.linalg.solve(A_damped, -JTr)
+            except torch._C._LinAlgError:
+                lam *= 10.0
+                continue
+            theta_new = theta + delta
+            loss_new = residual_fn(theta_new).detach().pow(2).sum().item()
+            if loss_new < loss:
+                theta, loss = theta_new, loss_new
+                lam = max(lam / 10.0, 1e-12)
+                accepted = True
+                break
+            lam *= 10.0
+        if not accepted:
+            break
+        if delta.norm().item() < tol * max(theta.norm().item(), 1.0):
+            break
+    return theta, loss, it

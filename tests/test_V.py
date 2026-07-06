@@ -350,10 +350,158 @@ def test_V4() -> GradResult:
 # Setup: render ground truth, recover via gradient descent, multiple random inits.
 # Claim: recovery variance across seeds rank-orders parameters the same way
 #        the Jacobian SVD predicts.
+#
+# Scope note: the docstring names two distinct Table-1 findings. T6's
+# substrate-confound result used a one-off inline 3-layer stack with no
+# reusable scene machinery; kernel_thinfilm/fabry_airy_R (used by both
+# existing scenes.py archetypes) is free-standing only. Built a real
+# fabry_airy_R_substrate + film_on_substrate scene (kernels.py/scenes.py) so
+# this can be tested as an actual recovery, not just a Jacobian-norm check
+# (verified fabry_airy_R_substrate matches T6's inline R3_s exactly, 0.0
+# max diff, before using it here).
+#
+# "Recovery via gradient descent, multiple random inits" turns out to need
+# care: with a NOISELESS residual, a real Newton-type optimizer (LM here,
+# since this genuinely is nonlinear least squares -- Adam/plain-GD would
+# either mask or fake the conditioning effect, see below) converges to the
+# exact global optimum from every random init regardless of conditioning
+# (verified: std=0 in both high- and low-contrast regimes after LM, ~4
+# iterations either way) -- there is no "recovery variance" to speak of
+# without noise. The actual falsifiable claim needs measurement noise: add
+# small IID noise to the rendered image per seed, recover via LM, and check
+# the resulting empirical parameter scatter against the classical
+# Gauss-Newton covariance formula Cov(theta_hat) ~ sigma^2 (J^T J)^-1 at the
+# true point -- the same Jacobian object already used for SVD-based ranking
+# in T9/G10, so "recovery variance matches the Jacobian SVD prediction" is
+# tested directly rather than by analogy. (Plain gradient descent with a
+# fixed step budget was tried first and gives a similar-looking result from
+# *different random inits* with no noise at all -- but that is an artifact
+# of an under-powered optimizer running out of budget, not a real
+# identifiability effect; LM with noise is the honest version.)
 # ---------------------------------------------------------------------------
 
-def test_V5() -> StructResult:
-    raise NotImplementedError("V5")
+def test_V5() -> list[StructResult]:
+    from src.spectral_grid import SpectralGrid
+    from src.scenes import film_on_substrate, two_bounce
+    from src.sensor import hyperspectral_fx10
+    from src.gradient import levenberg_marquardt
+
+    results: list[StructResult] = []
+
+    # --- Panel A: substrate confound (T6's own contrast endpoints) ---
+    N = 200
+    lam = torch.linspace(400.0, 700.0, N, dtype=torch.float64)
+    dlam = (lam[1] - lam[0]).item()
+    weights = torch.full_like(lam, dlam)
+    grid = SpectralGrid(nu_tilde=torch.zeros(N, dtype=torch.float64), lam=lam,
+                         weights=weights, N=N, d_nu=dlam)
+    sensor = hyperspectral_fx10(lam, M=20)
+    L_e = torch.full_like(lam, 4.2)
+
+    d_true, A_film, B_film, D_sub = 120.0, 1.5, 5000.0, 5000.0
+    noise_sigma_a = 1e-4
+    n_seeds_a = 40
+
+    def render_a(d, C_sub):
+        return film_on_substrate(grid, sensor, d=d, A=A_film, B=B_film,
+                                  C_sub=C_sub, D_sub=D_sub, cos_i=1.0, L_e=L_e).image
+
+    stds_a: dict[float, float] = {}
+    preds_a: dict[float, float] = {}
+    for C_sub in (1.80, 1.505):
+        img_true = render_a(torch.tensor(d_true), C_sub).detach()
+
+        d_req = torch.tensor(d_true, requires_grad=True)
+        J = torch.autograd.functional.jacobian(lambda d: render_a(d, C_sub), d_req).detach()
+        preds_a[C_sub] = noise_sigma_a / (J @ J).sqrt().item()
+
+        torch.manual_seed(42)
+        dhats = []
+        for _ in range(n_seeds_a):
+            img_noisy = img_true + torch.randn(img_true.shape) * noise_sigma_a
+            def residual_fn(theta, img_noisy=img_noisy, C_sub=C_sub):
+                return render_a(theta[0], C_sub) - img_noisy
+            theta_hat, _, _ = levenberg_marquardt(residual_fn, torch.tensor([d_true]))
+            dhats.append(theta_hat[0].item())
+        stds_a[C_sub] = torch.tensor(dhats).std().item()
+
+    for C_sub in (1.80, 1.505):
+        ratio = stds_a[C_sub] / preds_a[C_sub]
+        results.append(StructResult(
+            "V5", f"Panel A (substrate confound): empirical/predicted recovery std at C_sub={C_sub}",
+            ratio, 1.0, abs(ratio - 1.0), 0.5, abs(ratio - 1.0) < 0.5,
+            f"empirical_std={stds_a[C_sub]:.3e}  predicted_std={preds_a[C_sub]:.3e} (Gauss-Newton, sigma={noise_sigma_a:.0e})"))
+
+    regime_ratio_emp = stds_a[1.505] / stds_a[1.80]
+    regime_ratio_pred = preds_a[1.505] / preds_a[1.80]
+    rel = abs(regime_ratio_emp - regime_ratio_pred) / regime_ratio_pred
+    results.append(StructResult(
+        "V5", "Panel A: low/high-contrast recovery-std ratio matches Jacobian-predicted ratio",
+        regime_ratio_emp, regime_ratio_pred, rel, 0.3, rel < 0.3,
+        f"empirical ratio={regime_ratio_emp:.1f}x  predicted ratio={regime_ratio_pred:.1f}x -- "
+        "same confound T6 found via a bare Jacobian norm, now via real noisy recovery"))
+    results.append(StructResult(
+        "V5", "Panel A NOT vacuous: low-contrast recovery is genuinely much noisier",
+        regime_ratio_emp, None, None, 10.0, regime_ratio_emp > 10.0,
+        f"{regime_ratio_emp:.1f}x noisier recovery near C_sub=A_film=1.5 than at C_sub=1.80"))
+
+    # --- Panel B: B-bottleneck (T9/G10's exact 5-param operating point) ---
+    Nb = 300
+    lam_b = torch.linspace(400.0, 700.0, Nb, dtype=torch.float64)
+    dlam_b = (lam_b[1] - lam_b[0]).item()
+    grid_b = SpectralGrid(nu_tilde=torch.zeros(Nb, dtype=torch.float64), lam=lam_b,
+                           weights=torch.full_like(lam_b, dlam_b), N=Nb, d_nu=dlam_b)
+    sensor_b = hyperspectral_fx10(lam_b, M=20)
+    L_e_b = torch.full_like(lam_b, 4.2)
+
+    cos_i_b, lam_ex_b, qy_b = 1.0, 450.0, 0.8
+    theta_true = torch.tensor([120.0, 1.5, 5000.0, 30.0, 550.0])   # d, A, B, sigma_f, lam_em
+    names = ["d", "A", "B", "sigma_f", "lam_em"]
+    noise_sigma_b = 3e-4
+    n_seeds_b = 40
+
+    def render_b(theta):
+        d, A, B, sf, lem = theta[0], theta[1], theta[2], theta[3], theta[4]
+        return two_bounce(grid_b, sensor_b, d=d, A=A, B=B, cos_i=cos_i_b, lam_ex=lam_ex_b,
+                           lam_em=lem, sigma_f=sf, quantum_yield=qy_b, L_e=L_e_b).image
+
+    img_true_b = render_b(theta_true).detach()
+    theta_req = theta_true.clone().requires_grad_(True)
+    J_b = torch.autograd.functional.jacobian(render_b, theta_req).detach()
+    predicted_std_b = noise_sigma_b * torch.diag(torch.linalg.pinv(J_b.T @ J_b)).clamp(min=0).sqrt()
+
+    torch.manual_seed(7)
+    thetas_hat = []
+    for _ in range(n_seeds_b):
+        img_noisy = img_true_b + torch.randn(img_true_b.shape) * noise_sigma_b
+        def residual_fn(theta, img_noisy=img_noisy):
+            return render_b(theta) - img_noisy
+        theta_hat, _, _ = levenberg_marquardt(residual_fn, theta_true.clone())
+        thetas_hat.append(theta_hat)
+    empirical_std_b = torch.stack(thetas_hat).std(dim=0)
+
+    ratios_b = (empirical_std_b / predicted_std_b)
+    max_dev = (ratios_b - 1.0).abs().max().item()
+    results.append(StructResult(
+        "V5", "Panel B: empirical/predicted recovery std per-parameter (all 5, worst-case shown)",
+        max_dev, 0.0, max_dev, 0.5, max_dev < 0.5,
+        "ratios: " + " ".join(f"{n}={r:.3f}" for n, r in zip(names, ratios_b.tolist()))))
+
+    pred_rank = torch.argsort(predicted_std_b, descending=True).tolist()
+    emp_rank = torch.argsort(empirical_std_b, descending=True).tolist()
+    rank_match = pred_rank == emp_rank
+    results.append(StructResult(
+        "V5", "Panel B: empirical recovery-std ranking across params exactly matches Jacobian-predicted ranking",
+        float(rank_match), 1.0, float(not rank_match), 0.0, rank_match,
+        f"predicted (worst->best): {[names[i] for i in pred_rank]}  "
+        f"empirical: {[names[i] for i in emp_rank]}"))
+    results.append(StructResult(
+        "V5", "Panel B NOT vacuous: B is confirmed the worst-recovered parameter (bottleneck)",
+        float(names[emp_rank[0]] == "B"), 1.0, float(names[emp_rank[0]] != "B"), 0.0,
+        names[emp_rank[0]] == "B",
+        f"largest empirical recovery std belongs to '{names[emp_rank[0]]}' -- matches T9/G10's finding"))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
