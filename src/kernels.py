@@ -38,17 +38,23 @@ def kernel_fluorescence(
 # Thin-film (Fabry-Airy) kernel — internal helpers
 # ---------------------------------------------------------------------------
 
-def _fabry_airy_pol(r12: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
-    """Fabry-Airy power reflectance for one polarization, air-film-air (r23 = -r12).
+def _fabry_airy_pol(r12: torch.Tensor, phi: torch.Tensor, r23: torch.Tensor | None = None) -> torch.Tensor:
+    """Fabry-Airy power reflectance for one polarization.
+
+    r23 defaults to -r12 (free-standing air-film-air, r2=-r1 by symmetry).
+    Pass an explicit r23 for a film-on-substrate stack where the second
+    interface has its own index (see fabry_airy_R_substrate).
 
     Uses complex exponential for autograd through d, A, B.
     r12, phi: real tensors of identical shape.
     Returns real R of same shape.
     """
+    if r23 is None:
+        r23 = -r12
     eiphi = torch.polar(torch.ones_like(phi), phi)     # complex, |·|=1, arg=φ
-    A = r12 - r12 * eiphi                              # r12 + r23·exp(iφ), r23=-r12
-    B = 1.0 - r12 ** 2 * eiphi                         # 1 + r12·r23·exp(iφ)
-    return (A.abs() ** 2) / (B.abs() ** 2)
+    num = r12 + r23 * eiphi
+    den = 1.0 + r12 * r23 * eiphi
+    return (num.abs() ** 2) / (den.abs() ** 2)
 
 
 def _r12_and_phi(
@@ -101,6 +107,48 @@ def fabry_airy_R(
         R = _fabry_airy_pol(rp, phi)
     else:
         R = 0.5 * (_fabry_airy_pol(rs, phi) + _fabry_airy_pol(rp, phi))
+
+    return torch.where(tir, torch.ones_like(R), R)
+
+
+def fabry_airy_R_substrate(
+    lam: torch.Tensor,
+    cos_i,
+    d,
+    A: torch.Tensor | float,
+    B: torch.Tensor | float,
+    C_sub: torch.Tensor | float,
+    D_sub: torch.Tensor | float,
+    polarization: str = "unpolarized",
+) -> torch.Tensor:
+    """Fabry-Airy power reflectance for a thin film on a substrate (air/film/substrate).
+
+    Generalizes fabry_airy_R (free-standing, r23 = -r12) to a real film-substrate
+    interface with its own Cauchy index n_s = C_sub + D_sub/λ². Substrate-confound
+    regime (T6): as C_sub -> A, r23 -> 0 and d becomes unobservable in R(λ).
+
+    TIR is checked at both interfaces (air->film and film->substrate).
+    Returns R (N,) in [0, 1].
+    """
+    n_f = n_cauchy(lam, A, B)
+    cos_f = cos_theta_t(cos_i, 1.0, n_f)
+    n_s = n_cauchy(lam, C_sub, D_sub)
+    cos_s = cos_theta_t(cos_f, n_f, n_s)
+
+    tir = is_tir(cos_i, 1.0, n_f) | is_tir(cos_f, n_f, n_s)
+    phi = 4.0 * torch.pi * n_f * cos_f * d / lam
+
+    rs12 = fresnel_rs(1.0, n_f, cos_i, cos_f)
+    rp12 = fresnel_rp(1.0, n_f, cos_i, cos_f)
+    rs23 = fresnel_rs(n_f, n_s, cos_f, cos_s)
+    rp23 = fresnel_rp(n_f, n_s, cos_f, cos_s)
+
+    if polarization == "s":
+        R = _fabry_airy_pol(rs12, phi, rs23)
+    elif polarization == "p":
+        R = _fabry_airy_pol(rp12, phi, rp23)
+    else:
+        R = 0.5 * (_fabry_airy_pol(rs12, phi, rs23) + _fabry_airy_pol(rp12, phi, rp23))
 
     return torch.where(tir, torch.ones_like(R), R)
 

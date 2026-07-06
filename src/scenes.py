@@ -18,7 +18,7 @@ import torch
 
 from .data.cie_tables import d65_spd
 from .forward import neumann_forward
-from .kernels import kernel_thinfilm, kernel_fluorescence, check_hwp, fabry_airy_R
+from .kernels import kernel_thinfilm, kernel_fluorescence, check_hwp, fabry_airy_R, fabry_airy_R_substrate
 from .sensor import Sensor, _torch_interp
 from .spectral_grid import SpectralGrid
 
@@ -127,4 +127,46 @@ def two_bounce(
     K_fl = kernel_fluorescence(grid.lam, lam_ex, lam_em, sigma_f, grid.weights, quantum_yield)
     K    = K_tf + K_fl
     L    = neumann_forward(K, L_e, max_depth)
+    return ForwardResult(L=L, image=sensor.measure(L), K=K)
+
+
+# ---------------------------------------------------------------------------
+# Archetype 4 — film on a substrate (non-free-standing thin film)
+# ---------------------------------------------------------------------------
+
+def film_on_substrate(
+    grid:      SpectralGrid,
+    sensor:    Sensor,
+    *,
+    d,
+    A,
+    B,
+    C_sub,
+    D_sub,
+    cos_i,
+    max_depth: int = 1,
+    L_e:       torch.Tensor | None = None,
+    polarization: str = "unpolarized",
+) -> ForwardResult:
+    """Thin film on a substrate of different index (3-layer air/film/substrate).
+
+    Generalizes single_bounce_flat's free-standing film (r23 = -r12) to a
+    real film-substrate interface: n_s = C_sub + D_sub/lam^2. Substrate-confound
+    regime (T6): as C_sub -> A, r23 -> 0 and d becomes unobservable in R(lam),
+    independent of angle (this archetype is normally evaluated at cos_i near 1).
+
+    d, A, B:         film thickness [nm] and Cauchy coefficients (may require_grad).
+    C_sub, D_sub:    substrate Cauchy coefficients (may require_grad).
+    cos_i:           scalar cosine of incidence angle.
+    L_e:             (N,) source spectrum; defaults to D65 resampled onto grid.
+    """
+    if L_e is None:
+        L_e = d65_on_grid(grid)
+
+    R = fabry_airy_R_substrate(grid.lam, cos_i, d, A, B, C_sub, D_sub, polarization)
+    with torch.no_grad():
+        check_hwp(R, torch.zeros_like(R), torch.zeros_like(R), grid.weights)
+
+    K = torch.diag(R)
+    L = neumann_forward(K, L_e, max_depth)
     return ForwardResult(L=L, image=sensor.measure(L), K=K)
