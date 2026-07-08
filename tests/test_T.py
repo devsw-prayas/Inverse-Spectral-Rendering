@@ -281,8 +281,10 @@ def test_T4() -> list[StructResult]:
 
 # ---------------------------------------------------------------------------
 # T5: J_TIR finite at v=0
-# Claim (ss7): J_TIR^s,p(v) converges to 4*eta / 4*eta^3 on the propagating
-#              side. Formula must NOT be evaluated past v=0 (evanescent side)
+# Claim (ss7): J_TIR^s,p(v) converges to 4/eta / 4*eta on the propagating
+#              side (corrected per addendum_fcomposition_A12_A13_V9_findings.md
+#              -- physical BTDF carries a 1/eta^2 radiance-compression factor).
+#              Formula must NOT be evaluated past v=0 (evanescent side)
 #              without an explicit domain guard.
 # ---------------------------------------------------------------------------
 
@@ -296,8 +298,8 @@ def test_T5() -> list[StructResult]:
     n_t = torch.ones(1)
     cos_i = c.unsqueeze(0)
 
-    limit_s = 4.0 * eta             # J_TIR^s(0) = 4*eta
-    limit_p = 4.0 * eta ** 3        # J_TIR^p(0) = 4*eta^3
+    limit_s = 4.0 / eta             # J_TIR^s(0) = 4/eta
+    limit_p = 4.0 * eta             # J_TIR^p(0) = 4*eta
 
     # -- convergence sweep: v from 0.1 down to 1e-8 (propagating side, v > 0) --
     # convergence is first-order in v: rel_err ~ 2v/(eta*c)
@@ -314,12 +316,12 @@ def test_T5() -> list[StructResult]:
     tol_conv = 1e-9
     results = [
         StructResult(
-            "T5", "J_TIR^s(v=1e-8) rel err vs 4*eta",
+            "T5", "J_TIR^s(v=1e-8) rel err vs 4/eta",
             errs_s[-1], 0.0, errs_s[-1], tol_conv, errs_s[-1] < tol_conv,
             "converges: " + " ".join(f"{e:.1e}" for e in errs_s),
         ),
         StructResult(
-            "T5", "J_TIR^p(v=1e-8) rel err vs 4*eta^3",
+            "T5", "J_TIR^p(v=1e-8) rel err vs 4*eta",
             errs_p[-1], 0.0, errs_p[-1], tol_conv, errs_p[-1] < tol_conv,
             "converges: " + " ".join(f"{e:.1e}" for e in errs_p),
         ),
@@ -331,7 +333,7 @@ def test_T5() -> list[StructResult]:
     jp_evan = tir_jacobian(v_evan, n_i, n_t, cos_i, polarization="p").item()
     rel_guard = abs(jp_evan - limit_p.item()) / limit_p.item()
     results.append(StructResult(
-        "T5", "domain guard: |J_p(v=-0.1) - 4*eta^3|/4*eta^3 >> 0",
+        "T5", "domain guard: |J_p(v=-0.1) - 4*eta|/4*eta >> 0",
         rel_guard, None, None, 0.5,
         rel_guard > 0.5,
         f"J_p(v=-0.1) = {jp_evan:.4f}, limit = {limit_p:.4f} -- guard necessary",
@@ -612,7 +614,7 @@ def test_T12() -> list[StructResult]:
     grad_kernel = A_ag.grad.item()
 
     # Boundary term: -J_TIR_s(v=0, n_i=kappa) * e_n(lambda*) * dlambda*/dA
-    # J_TIR_s(v=0) = 4*kappa (Theorem 3 s-pol limit, verified T5)
+    # J_TIR_s(v=0) = 4/kappa (Theorem 3 s-pol limit, verified T5)
     lam_star_v = float(lam_star_fn(A_val, B_val, cos_i))       # ~420 nm
     dlam_dA_v  = float(dlambda_star_dA(lam_star_v, B_val))     # lambda*^3 / (2B)
     J_bdry     = tir_jacobian(

@@ -14,7 +14,7 @@ Run:
 
 Tests
 -----
-G1   J_TIR v-sweep              -- J_theta(v), T(v), product lands on 4eta/4eta^3
+G1   J_TIR v-sweep              -- J_theta(v), T(v), product lands on 4/eta, 4eta
 G2   theta_i sweep Jacobians    -- J_||, J_perp, det vs theta for several eta
 G3   Moving-boundary sweep      -- dI/dA continuous, =0 outside window, no kink at edges  [<-T10]
 G4   Multi-fluorophore cond.    -- condition number vs emission-peak separation -> vertical asymptote
@@ -45,7 +45,10 @@ FIGURES_DIR = Path(__file__).parent.parent / "results" / "figures"
 # X-axis: v, 1 -> 0
 # Y-axis: J_theta(v), T(v), product J_TIR(v) -- s and p polarizations
 # Predicted shape: J_theta diverges ~1/v, T->0 linearly, product lands exactly
-#                  on 4*eta / 4*eta^3
+#                  on 4/eta / 4*eta (corrected per addendum_fcomposition_A12_
+#                  A13_V9_findings.md -- physical BTDF carries a 1/eta^2
+#                  radiance-compression factor, cancelling one eta^2 out of
+#                  the raw solid-angle det)
 # Failure: kink, overshoot, or product misses the asymptote
 # ---------------------------------------------------------------------------
 
@@ -78,10 +81,13 @@ def test_G1() -> list[StructResult]:
     Ts_naive = 1.0 - rs ** 2
     Tp_naive = 1.0 - rp ** 2
 
-    J_s = Ts * det
-    J_p = Tp * det
-    J_s_naive = Ts_naive * det
-    J_p_naive = Tp_naive * det
+    # Physical BTDF throughput is T(v)/eta^2 (n^2-law radiance compression,
+    # Veach 1997 Sec5.2), not bare T(v) -- divide by eta^2 to match the
+    # physically-complete quantity tir_jacobian() now returns.
+    J_s = Ts * det / eta ** 2
+    J_p = Tp * det / eta ** 2
+    J_s_naive = Ts_naive * det / eta ** 2
+    J_p_naive = Tp_naive * det / eta ** 2
     J_s_closed = tir_jacobian(v, n_i, n_t, cos_i, polarization="s")
     J_p_closed = tir_jacobian(v, n_i, n_t, cos_i, polarization="p")
 
@@ -104,9 +110,9 @@ def test_G1() -> list[StructResult]:
     rel_Ts = abs((Ts[-1] / v[-1]).item() - lim_s) / lim_s
     rel_Tp = abs((Tp[-1] / v[-1]).item() - lim_p) / lim_p
 
-    # Check 3: product lands on the TIR-collapse limits 4*eta, 4*eta^3.
-    rel_prod_s = abs(J_s[-1].item() - 4.0 * eta) / (4.0 * eta)
-    rel_prod_p = abs(J_p[-1].item() - 4.0 * eta ** 3) / (4.0 * eta ** 3)
+    # Check 3: product lands on the TIR-collapse limits 4/eta, 4*eta.
+    rel_prod_s = abs(J_s[-1].item() - 4.0 / eta) / (4.0 / eta)
+    rel_prod_p = abs(J_p[-1].item() - 4.0 * eta) / (4.0 * eta)
 
     # Check 4: stable rational T(v) agrees with tir_jacobian's closed form at
     # every v in the sweep -- two independently-coded paths must match.
@@ -144,11 +150,11 @@ def test_G1() -> list[StructResult]:
         StructResult("G1", "T_p(v)/v -> 4*eta/c as v->0",
                      (Tp[-1] / v[-1]).item(), lim_p, rel_Tp, tol, rel_Tp < tol,
                      f"eta={eta}, c={c}, stable rational form"),
-        StructResult("G1", "J_TIR^s(v=1e-12) -> 4*eta",
-                     J_s[-1].item(), 4.0 * eta, rel_prod_s, tol,
+        StructResult("G1", "J_TIR^s(v=1e-12) -> 4/eta",
+                     J_s[-1].item(), 4.0 / eta, rel_prod_s, tol,
                      rel_prod_s < tol, "stable rational T(v), not naive 1-r^2"),
-        StructResult("G1", "J_TIR^p(v=1e-12) -> 4*eta^3",
-                     J_p[-1].item(), 4.0 * eta ** 3, rel_prod_p, tol,
+        StructResult("G1", "J_TIR^p(v=1e-12) -> 4*eta",
+                     J_p[-1].item(), 4.0 * eta, rel_prod_p, tol,
                      rel_prod_p < tol, "stable rational T(v), not naive 1-r^2"),
         StructResult("G1", "stable T(v) vs tir_jacobian closed form, s-pol, max over sweep",
                      max_rel_cross_s, 0.0, max_rel_cross_s, tol, max_rel_cross_s < tol,
@@ -324,7 +330,7 @@ def test_G3() -> list[StructResult]:
         return (J * e_n * dlam * prop).sum().item()
 
     # Boundary-term J factor: at lambda=lambda*(A), v=0 by definition (that's
-    # the critical condition n(lambda*)=kappa), so J_TIR(v=0) = 4*kappa is
+    # the critical condition n(lambda*)=kappa), so J_TIR(v=0) = 4/kappa is
     # the SAME constant for every A in the sweep -- lambda* moves, but it
     # always moves along the v=0 contour. Full Leibniz boundary term is
     # -J(v=0)*e_n(lambda*)*dlambda*/dA, not just -e_n(lambda*)*dlambda*/dA
