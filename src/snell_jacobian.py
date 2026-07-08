@@ -85,17 +85,24 @@ def tir_jacobian(
     cos_i: torch.Tensor,
     polarization: str = "unpolarized",
 ) -> torch.Tensor:
-    """TIR-safe scalar J_TIR(v) = T_Fresnel(v) · η²c/v  (Theorem 3).
+    """TIR-safe scalar J_TIR(v) = f_BTDF(v) · η²c/v  (Theorem 3).
+
+    f_BTDF(v) = T_Fresnel(v) / η² is the physically complete BTDF throughput,
+    including the n²-law radiance-compression factor across the refracting
+    interface (Veach 1997 §5.2 non-symmetric scattering) — not bare Fresnel
+    power transmittance. The η² cancels exactly against the solid-angle det's
+    own η² (see solid_angle_ratio), leaving J_TIR = T_Fresnel(v) · c/v.
 
     The 0×∞ at v = cosθ_t → 0 resolves analytically to a finite limit:
-        J_TIR^s(0) = 4η,   J_TIR^p(0) = 4η³
+        J_TIR^s(0) = 4/η,   J_TIR^p(0) = 4η
 
     Closed forms (real-analytic at v = 0):
-        J_TIR^s(v) = 4η³c² / (ηc + v)²
-        J_TIR^p(v) = 4η³c² / (c + ηv)²
+        J_TIR^s(v) = 4ηc² / (ηc + v)²
+        J_TIR^p(v) = 4ηc² / (c + ηv)²
 
-    Derived from T_s = 4ηcv/(ηc+v)² and T_p = 4ηcv/(c+ηv)² multiplied by
-    the solid-angle det η²c/v — the v cancels exactly, leaving rational forms.
+    Derived from T_s = 4ηcv/(ηc+v)² and T_p = 4ηcv/(c+ηv)², divided by η²
+    (radiance compression) and multiplied by the solid-angle det η²c/v — the
+    v and one power of η² cancel exactly, leaving rational forms.
 
     v:     (N,)  cosθ_t, must be ≥ 0 (TIR wavelengths should be masked by caller)
     n_i, n_t, cos_i: (N,)
@@ -103,8 +110,8 @@ def tir_jacobian(
     """
     eta = n_i / n_t
     c   = cos_i
-    J_s = 4.0 * eta ** 3 * c ** 2 / (eta * c + v) ** 2
-    J_p = 4.0 * eta ** 3 * c ** 2 / (c + eta * v) ** 2
+    J_s = 4.0 * eta * c ** 2 / (eta * c + v) ** 2
+    J_p = 4.0 * eta * c ** 2 / (c + eta * v) ** 2
     if polarization == "s":
         return J_s
     elif polarization == "p":
