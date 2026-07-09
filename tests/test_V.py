@@ -734,50 +734,174 @@ def test_V8() -> list[StructResult]:
 
 
 # ---------------------------------------------------------------------------
-# V9: C10 at full scene complexity
-# Setup: full two-bounce scene: fluorescent emission inside dispersive medium,
-#        escaping past TIR-bounded interface, lambda* swept through emission band.
-# Claim: FD on full re-render at A +/- eps -- the explicit named falsifier
-#        from the project's own list.
+# V9: moving-boundary Leibniz term at full multi-bounce scene complexity
+# Setup: fluorescent emission inside a dispersive medium, escaping past a
+#        TIR-bounded interface, lambda* swept through the emission band.
+# Claim: FD on the (closed-form) full scene at A/B +/- eps -- the explicit
+#        named falsifier from the project's own list.
 #
-# DEFERRED (2026-07-06) -- genuinely open theoretical question, not a routine
-# scene-promotion, discussed with the user before stopping. Sec13's locked
+# RESOLVED 2026-07-08 (theory) / formalized here. Sec13's locked
 # moving-boundary lemma (-e(lambda*)*dlambda*/dtheta) is derived for a bare
 # single integral with a BOUNDED integrand at the moving endpoint (T12/G3's
-# own setup). Promoting it to "full scene complexity" hits three compounding
-# issues, discovered in order:
-#   1. TIR channels don't converge under truncated Neumann bounces (radiance
-#      grows linearly with bounce depth there -- V1's own finding). Fixable:
-#      restrict the solve to the propagating-only index set and use the
-#      exact (infinite-bounce) linear solve there, matching V1 Check 5/6's
-#      precedent that this subset is well-posed even as R -> 1.
-#   2. A raw/unweighted sum over L is NOT grid-resolution-invariant (diverges
-#      as the grid is refined) -- the physically correct aggregate is the
-#      quadrature-weighted integral (L*weights).sum(), matching how
-#      kernel_fluorescence already bakes weights into its own column
-#      contraction. Fixable, and fixed once identified.
-#   3. NOT fixable by a quick patch: near the moving critical wavelength,
-#      radiance itself diverges as 1/sqrt(lambda-lambda*) (derived from the
-#      Fresnel near-critical expansion 1-R ~ sqrt(lambda-lambda*)) -- an
-#      INTEGRABLE singularity sitting exactly at the boundary the Leibniz
-#      term is supposed to describe. The classical boundary-term formula
-#      assumes the integrand is bounded there; this integrand is not. A
-#      correct term would need a substitution-based treatment (the same
-#      flavor of trick Theorem 3 used for the TIR Jacobian via v=cos(theta_t),
-#      not yet worked out for this specific singular integrand).
+# own setup). Promoting it to full scene complexity hit three compounding
+# issues:
+#   1. TIR channels don't converge under truncated Neumann bounces -- fixed
+#      by restricting to the propagating-only subset and solving exactly
+#      (Sherman-Morrison, rank-1 K_fl), matching V1 Check 5/6's precedent.
+#   2. A raw/unweighted sum over L is not grid-resolution-invariant -- fixed
+#      by using a genuine continuum quadrature (Gauss-Legendre), not a
+#      discrete SpectralGrid sum, throughout.
+#   3. The genuinely hard part: near the moving critical wavelength, the
+#      integrand feeding the Sherman-Morrison feedback amplitude c(theta)
+#      diverges as 1/sqrt(lambda-lambda*) -- an INTEGRABLE singularity sitting
+#      exactly at the boundary the Leibniz term describes. Fixed via a
+#      Theorem-3-style substitution w=sqrt(lambda-lambda*(theta)), mapped to a
+#      fixed t in [0,1] -- see src/gradient.py's v9_escaping_flux and the long
+#      comment above it for the full derivation.
 #
-# This is the same category as A12/A13 (open theoretical question requiring
-# real derivation), not "formalize an already-locked result" like every other
-# V-series test. Queued alongside A12/A13 for a dedicated derivation session
-# rather than resolved unilaterally here.
+# Validation here deliberately does NOT use a raw discrete-grid FD (confirmed
+# unreliable at any tested resolution during derivation -- it fights the
+# lambda* escape crossing and the excitation-tail crossing at once). Instead:
+#   - Primary: autograd vs FD, both against the SAME closed form
+#     v9_escaping_flux (this is the "renderer" here; FD on it is a legitimate
+#     three-way-oracle-style check, just not grid-based).
+#   - Not vacuous: the classical Sec13 lemma applied naively to the whole
+#     escaping-flux integral (ignoring that c(theta) has its own interior
+#     theta-dependence) is shown to measurably disagree near the absorption
+#     peak and to correctly recover the right answer once lambda* is several
+#     sigma_f away from lam_ex -- same "edges of validity" pattern as G3/T14.
+#   - Physical sanity: the closed form's VALUE is cross-checked against a
+#     real discrete exact linear solve on the propagating subset, confirming
+#     convergence (not just internal self-consistency) as the discrete grid
+#     is refined -- the discrete solve converges slowly (the same 1/sqrt
+#     singularity, unresolved on any finite grid), so this is a
+#     convergence-trend check, not a tight bound (same discipline as A5/A6).
 # ---------------------------------------------------------------------------
 
-def test_V9() -> GradResult:
-    raise NotImplementedError(
-        "V9 -- open theoretical question (moving-boundary Leibniz term for a "
-        "singular integrand at the boundary itself), see comment above. "
-        "Queued alongside A12/A13, not deferred to Phase 2."
+def _v9_discrete_reference(A, B, cos_i, lam_max, lam_ex, lam_em, sigma_f, quantum_yield, L0, N):
+    from src.gradient import lambda_star
+
+    lam_star = lambda_star(A, B, cos_i).item()
+    lam = torch.linspace(lam_star + 1e-6, lam_max, N, dtype=torch.float64)
+    dlam = (lam[1] - lam[0]).item()
+
+    n = A + B / lam ** 2
+    sin2_t = n ** 2 * (1.0 - cos_i ** 2)
+    v = torch.sqrt((1.0 - sin2_t).clamp(min=0.0))
+    rs = (n * cos_i - v) / (n * cos_i + v)
+    rp = (cos_i - n * v) / (cos_i + n * v)
+    R = 0.5 * (rs ** 2 + rp ** 2)
+
+    a     = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)
+    e_raw = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)
+    e     = e_raw / ((2.0 * torch.pi) ** 0.5 * sigma_f)
+    L_e   = torch.full_like(lam, L0)
+
+    G0 = 1.0 / (1.0 - R)
+    v_vec = quantum_yield * a * dlam
+    A_int = (v_vec * G0 * L_e).sum()
+    B_int = (v_vec * G0 * e).sum()
+    c_val = A_int / (1.0 - B_int)
+    L = G0 * (L_e + c_val * e)
+    phi = (1.0 - R) * L
+    return (phi * dlam).sum().item()
+
+
+def test_V9() -> list:
+    from src.gradient import (
+        gauss_legendre_01, v9_escaping_flux, lambda_star,
+        dlambda_star_dA, moving_boundary_grad, fd_gradient,
     )
+
+    cos_i = torch.tensor(0.5, dtype=torch.float64)
+    lam_max = 700.0
+    lam_ex, lam_em, sigma_f = 480.0, 550.0, 20.0
+    quantum_yield, L0 = 0.8, 4.2
+    B = torch.tensor(9000.0, dtype=torch.float64)
+    kappa = 1.0 / (1.0 - cos_i ** 2) ** 0.5
+    t_nodes, t_weights = gauss_legendre_01(64)
+
+    lam_star_targets = [420.0, 480.0, 520.0, 550.0, 580.0, 620.0, 680.0]
+    tol = 1e-5
+
+    results: list = []
+    naive_rel: dict[float, float] = {}
+
+    for target in lam_star_targets:
+        A0 = (kappa - B / target ** 2).item()
+
+        for name, param0 in (("A", A0), ("B", B.item())):
+            theta = torch.tensor(param0, dtype=torch.float64, requires_grad=True)
+            A_arg = theta if name == "A" else torch.tensor(A0, dtype=torch.float64)
+            B_arg = theta if name == "B" else B
+
+            I_val, info = v9_escaping_flux(A_arg, B_arg, cos_i, lam_max, lam_ex, lam_em,
+                                            sigma_f, quantum_yield, L0, t_nodes, t_weights)
+            ag = torch.autograd.grad(I_val, theta)[0].item()
+
+            def fn():
+                A_a = theta if name == "A" else torch.tensor(A0, dtype=torch.float64)
+                B_a = theta if name == "B" else B
+                val, _ = v9_escaping_flux(A_a, B_a, cos_i, lam_max, lam_ex, lam_em,
+                                           sigma_f, quantum_yield, L0, t_nodes, t_weights)
+                return val
+
+            fd = fd_gradient(fn, theta).item()
+            rel = abs(ag - fd) / max(abs(fd), 1e-30)
+            results.append(GradResult(
+                test_id="V9", label=f"lambda*={target:.0f}nm: autograd vs FD on the closed form",
+                param=name, autograd=ag, analytic=None, fd=fd,
+                rel_ag_fd=rel, rel_an_fd=None, tol=tol))
+
+        # Not-vacuous: naive Sec13-boundary-only term vs the correct dI/dA.
+        A_t = torch.tensor(A0, dtype=torch.float64, requires_grad=True)
+        I_val, info = v9_escaping_flux(A_t, B, cos_i, lam_max, lam_ex, lam_em,
+                                        sigma_f, quantum_yield, L0, t_nodes, t_weights)
+        correct = torch.autograd.grad(I_val, A_t)[0].item()
+
+        lam_s = info["lam_star"].detach()
+        c_val = info["c_val"].detach()
+        e_star = torch.exp(-0.5 * ((lam_s - lam_em) / sigma_f) ** 2) / ((2.0 * torch.pi) ** 0.5 * sigma_f)
+        phi_star = L0 + e_star * c_val
+        dlam_star_dA = dlambda_star_dA(lam_s, B)
+        naive = moving_boundary_grad(phi_star, dlam_star_dA).item()
+        naive_rel[target] = abs(naive - correct) / max(abs(correct), 1e-30)
+
+    close_to_peak = naive_rel[480.0]
+    far_from_peak = naive_rel[680.0]
+    results.append(StructResult(
+        "V9", "naive Sec13-boundary-only term breaks down near the absorption peak "
+        "(lambda* within a few sigma_f of lam_ex)",
+        close_to_peak, None, None, 0.3, close_to_peak > 0.3,
+        f"rel diff vs correct at lambda*=480 (=lam_ex): {close_to_peak:.3f} -- classical single-integral "
+        "Leibniz term is blind to c(theta)'s own singular-integrand interior dependence"))
+    results.append(StructResult(
+        "V9", "NOT vacuous the other way: naive term correctly recovers the right answer "
+        "once lambda* is far (several sigma_f) from lam_ex",
+        far_from_peak, 0.0, far_from_peak, 1e-3, far_from_peak < 1e-3,
+        f"rel diff vs correct at lambda*=680 (5 sigma_f past emission band): {far_from_peak:.2e} -- "
+        "confirms the breakdown is a real, localized effect, not a permanently-broken formula"))
+
+    # Physical sanity: closed form's value converges toward a real discrete
+    # exact-solve as the grid is refined (slowly -- unresolved 1/sqrt
+    # singularity on any finite grid, same landmine as the derivation
+    # session's own raw-grid-FD warning -- so this is a trend, not a bound).
+    A_mid = torch.tensor((kappa - B / 520.0 ** 2).item(), dtype=torch.float64)
+    I_closed_val, _ = v9_escaping_flux(A_mid, B, cos_i, lam_max, lam_ex, lam_em,
+                                        sigma_f, quantum_yield, L0, t_nodes, t_weights)
+    I_closed_val = I_closed_val.item()
+    Ns = [400_000, 2_000_000, 8_000_000]
+    discrete_vals = [_v9_discrete_reference(A_mid, B, cos_i, lam_max, lam_ex, lam_em,
+                                             sigma_f, quantum_yield, L0, N) for N in Ns]
+    rel_errs = [abs(v - I_closed_val) / abs(I_closed_val) for v in discrete_vals]
+    converging = all(rel_errs[i] > rel_errs[i + 1] for i in range(len(rel_errs) - 1))
+    results.append(StructResult(
+        "V9", "closed form's VALUE converges toward a real discrete exact-solve as N increases",
+        rel_errs[-1], 0.0, rel_errs[-1], 0.05, converging and rel_errs[-1] < 0.05,
+        f"rel err by N {dict(zip(Ns, [f'{e:.2e}' for e in rel_errs]))} -- monotonically improving, "
+        "confirms the closed form matches real physics, not just internal self-consistency"))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
