@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from .cauchy_ior import n_cauchy, cos_theta_t
 from .forward import neumann_forward
 from .kernels import kernel_fluorescence
 
@@ -309,6 +310,139 @@ def moving_boundary_grad(
     profile evaluated at λ*; dlam_star_dtheta from dlambda_star_dA/dB.
     """
     return -e_at_star * dlam_star_dtheta
+
+
+# ---------------------------------------------------------------------------
+# V9: moving-boundary Leibniz term at full multi-bounce scene complexity
+# ---------------------------------------------------------------------------
+#
+# Scene: fluorescence (K_fl, rank-1) living inside a dispersive medium behind
+# a single TIR-bounded interface (K_e = diag(R(lam)), plain Fresnel R -- no
+# thin-film oscillation here). Solved exactly (Sherman-Morrison, not a
+# truncated Neumann series) on the propagating-only subset Omega =
+# {lam : lam > lambda_star(A,B)}, matching V1 Check 5/6's precedent that this
+# restriction is well-posed even as R -> 1 at the boundary.
+#
+# Since G0 := (I - diag(R))^-1 is diagonal, (1-R)*G0 = 1 exactly, so the
+# escaping-flux density collapses to phi(lam) = L_e(lam) + e(lam)*c, with the
+# feedback amplitude c = qy*A_int/(1 - qy*B_int) (Sherman-Morrison scalar for
+# the rank-1 K_fl = e (x) v term). The measured quantity is
+#     I(theta) = integral_{lambda_star(theta)}^{lam_max} phi(lam) dlam = P + c*Q
+# P, Q (bare L_e, e integrals) are smooth/bounded -- their moving-boundary
+# term is exactly the already-locked lambda_star/moving_boundary_grad lemma
+# above. But A_int, B_int (integrals of a(lam')/(1-R(lam')) against L_e, e)
+# have an INTEGRABLE 1/sqrt(lam'-lambda_star) singularity right at the moving
+# boundary itself (1-R ~ v ~ sqrt(lam'-lambda_star) near the critical
+# wavelength) -- the moving-boundary lemma assumes a BOUNDED integrand there,
+# so it only applies directly to P and Q, not A_int/B_int.
+#
+# Fix: substitute w = sqrt(lam - lambda_star(theta)), then w = W(theta)*t,
+# t in [0,1], W(theta) = sqrt(lam_max - lambda_star(theta)). dlam = 2w dw
+# cancels the leading 1/w blowup exactly, AND fixes the integration domain to
+# [0,1] so autograd differentiates straight through
+# theta -> lambda_star(theta) -> the integrand, recovering both the boundary
+# term and the interior R(lam;theta) dependence automatically -- no
+# hand-assembled Leibniz term needed for A_int/B_int. Quadrature uses
+# Gauss-Legendre nodes on the OPEN interval (0,1) (via Golub-Welsch
+# eigendecomposition, pure torch, no numpy) -- critically, none of the nodes
+# land on the endpoint t=0, which is a removable-but-literal 0/0 at the exact
+# critical wavelength (1-R and dlam/dw both vanish there).
+# ---------------------------------------------------------------------------
+
+def gauss_legendre_01(n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gauss-Legendre quadrature nodes/weights on the open interval (0, 1).
+
+    Nodes are eigenvalues of the tridiagonal Jacobi matrix for Legendre
+    polynomials (Golub-Welsch); weights come from the first component of each
+    eigenvector. All nodes are strictly interior to (0, 1) -- unlike a
+    Simpson/trapezoid rule, none lands on an endpoint, which matters when
+    t=0 is a removable-but-literal singularity (see module comment above).
+    """
+    k = torch.arange(1, n, dtype=torch.float64)
+    beta = k / torch.sqrt(4.0 * k ** 2 - 1.0)
+    J = torch.diag(beta, 1) + torch.diag(beta, -1)
+    nodes, vecs = torch.linalg.eigh(J)
+    weights = 2.0 * vecs[0, :] ** 2
+    return 0.5 * (nodes + 1.0), 0.5 * weights
+
+
+def interface_T_stable(
+    v:            torch.Tensor,
+    eta:          torch.Tensor,
+    cos_i:        torch.Tensor | float,
+    polarization: str = "unpolarized",
+) -> torch.Tensor:
+    """Stable T(v) = 1 - R for a single dielectric interface, v = cosθ_t.
+
+    Same cancellation landmine as G1/tir_jacobian: naive 1 - r² loses several
+    orders of magnitude near v -> 0 (r -> 1, r² computed near 1, subtracted
+    from 1). Uses the rational form directly instead (numerator explicitly
+    O(v), no subtraction of near-equal quantities):
+        T_s(v) = 4ηcv / (ηc + v)²,   T_p(v) = 4ηcv / (c + ηv)²
+    """
+    c   = cos_i
+    T_s = 4.0 * eta * c * v / (eta * c + v) ** 2
+    T_p = 4.0 * eta * c * v / (c + eta * v) ** 2
+    if polarization == "s":
+        return T_s
+    if polarization == "p":
+        return T_p
+    return 0.5 * (T_s + T_p)
+
+
+def v9_escaping_flux(
+    A:             torch.Tensor,
+    B:             torch.Tensor,
+    cos_i:         torch.Tensor | float,
+    lam_max:       float,
+    lam_ex:        float,
+    lam_em:        float,
+    sigma_f:       float,
+    quantum_yield: float,
+    L0:            float,
+    t_nodes:       torch.Tensor,
+    t_weights:     torch.Tensor,
+    polarization:  str = "unpolarized",
+) -> tuple[torch.Tensor, dict]:
+    """I(θ) = ∫_{λ*(A,B)}^{lam_max} (1−R(λ))·L(λ) dλ, fixed-domain reformulation.
+
+    θ ∈ {A, B} enters only through λ*(θ); w = √(λ−λ*), w = W(θ)·t maps the
+    moving domain to a fixed t ∈ [0,1] (see module comment). Differentiable
+    end to end via plain torch autograd — both the λ_max boundary term (via
+    W(θ)) and the interior R(λ;θ) dependence come out automatically.
+
+    L_e is a flat illuminant (constant L0); a, e are the usual peak-1 /
+    unit-integral Gaussians (continuum normalization √(2π)σ_f — exact, no
+    grid needed).
+
+    Returns (I, info); info carries lam_star, W, and the A_int/B_int/P/Q/c
+    intermediates (used for the naive-boundary-only comparison in test_V9).
+    """
+    lam_star = lambda_star(A, B, cos_i)
+    W = torch.sqrt(lam_max - lam_star)
+    w = W * t_nodes
+    lam = lam_star + w ** 2
+
+    n = n_cauchy(lam, A, B)
+    v = cos_theta_t(cos_i, n, 1.0)
+    Tv = interface_T_stable(v, n, cos_i, polarization)
+
+    a     = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)
+    e_raw = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)
+    e     = e_raw / ((2.0 * torch.pi) ** 0.5 * sigma_f)
+    L_e   = torch.full_like(lam, L0)
+
+    dlam = 2.0 * w * t_weights * W   # dλ = 2w dw = 2w·W dt
+
+    A_int = (dlam * a * L_e / Tv).sum()
+    B_int = (dlam * a * e / Tv).sum()
+    P_val = (dlam * L_e).sum()
+    Q_val = (dlam * e).sum()
+
+    c_val = quantum_yield * A_int / (1.0 - quantum_yield * B_int)
+    I_val = P_val + c_val * Q_val
+    return I_val, dict(lam_star=lam_star, W=W, A_int=A_int, B_int=B_int,
+                        P_val=P_val, Q_val=Q_val, c_val=c_val)
 
 
 # ---------------------------------------------------------------------------
