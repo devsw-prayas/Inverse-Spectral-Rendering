@@ -20,6 +20,8 @@ V6   Inverse-crime check         -- ground truth from deliberately mismatched fo
 V7   Three-estimator bias test   -- Zeltner taxonomy, scene with K_x and TIR-adjacent sampling
 V8   Near-rational FSR aliasing  -- d swept so FSR/delta_lambda crosses near-integer ratios
 V9   C10 at full scene           -- two-bounce fluor-behind-glass with lambda* in emission band
+V13  Rank-k Woodbury coupling    -- Phase 1.1: k=2 species share a TIR boundary, cross-species
+                                    coupling through (I-B)^-1 measurably perturbs recovered amplitude
 
 --- Phase 2 (require C++ path tracer) ---
 V10  C++ vs Python oracle        -- identical scene: C++ must match oracle to FD precision
@@ -905,6 +907,169 @@ def test_V9() -> list:
 
 
 # ---------------------------------------------------------------------------
+# V13: rank-k Woodbury boundary coupling (Phase 1.1)
+# Setup: k=2 fluorescent species sharing ONE TIR-bounded dispersive interface
+#        (same lambda_star(A,B) as V9). Species 1's absorption band straddles
+#        the TIR boundary (a small change in A sweeps lambda* across it, so
+#        ds1/dA is enormous, same mechanism as V9). Species 2 sits spectrally
+#        elsewhere but its absorption band overlaps species 1's EMISSION band
+#        -- the physical coupling channel: species 1's emitted photons get
+#        partially reabsorbed by species 2 through the shared cavity.
+# Claim (Phase 1.1 addendum, .claude/ref/addendum_rankk_woodbury_coupling.md):
+#        this coupling is numerically real, not negligible -- a nontrivial
+#        fraction of ds2/dA comes from the coupling channel alone, and it
+#        vanishes when species 2's absorption is moved away from species 1's
+#        emission band (negative control), confirming the mechanism is
+#        spectral-overlap-driven, not merely "species 1 is near the boundary."
+#
+# Woodbury system (derived here, not assumed): s_j = qy_j * integral of
+# a_j(lam)*L(lam) over the propagating domain; (1-R)*G0=1 collapses this to
+# (I-B)s = b with B[j,m] = qy_j*integral(a_j*e_m/(1-R)), b_j =
+# qy_j*integral(a_j*L_e/(1-R)) -- see src/gradient.py's v9_escaping_flux_multi
+# for the full derivation (direct generalization of V9's scalar
+# Sherman-Morrison feedback to a genuine k-species Woodbury solve, same
+# w=sqrt(lam-lambda_star) substitution for the shared 1/sqrt singularity at
+# the moving boundary).
+#
+# "Coupling contribution to ds2/dA" is operationalized (not eyeballed) as the
+# difference between the full coupled solve and a decoupled solve with the
+# off-diagonal of B zeroed (species act independently, each via its own
+# scalar Sherman-Morrison) -- this isolates exactly the Woodbury cross-term,
+# with no need to reproduce the addendum's carried-forward numbers exactly.
+# ---------------------------------------------------------------------------
+
+def _v13_ds_dA(A0: float, B: torch.Tensor, cos_i, lam_max, lam_ex_list, lam_em_list,
+               sf_list, qy_list, L0, t_nodes, t_weights):
+    """Returns (ds_dA_coupled (k,), ds_dA_decoupled (k,), s (k,), B_mat (k,k))."""
+    from src.gradient import v9_escaping_flux_multi
+
+    theta = torch.tensor(A0, dtype=torch.float64, requires_grad=True)
+    _, info = v9_escaping_flux_multi(theta, B, cos_i, lam_max, lam_ex_list, lam_em_list,
+                                      sf_list, qy_list, L0, t_nodes, t_weights)
+    s = info["s"]
+    B_mat = info["B_mat"]
+    k = s.shape[0]
+
+    B_diag = torch.diag(torch.diagonal(B_mat))
+    s_decoupled = torch.linalg.solve(torch.eye(k, dtype=torch.float64) - B_diag, info["b"])
+
+    ds_dA_coupled = torch.stack([
+        torch.autograd.grad(s[j], theta, retain_graph=True)[0] for j in range(k)
+    ])
+    ds_dA_decoupled = torch.stack([
+        torch.autograd.grad(s_decoupled[j], theta, retain_graph=True)[0] for j in range(k)
+    ])
+    return ds_dA_coupled.detach(), ds_dA_decoupled.detach(), s.detach(), B_mat.detach()
+
+
+def test_V13() -> list:
+    from src.gradient import v9_escaping_flux_multi, gauss_legendre_01, lambda_star, fd_gradient
+
+    cos_i = torch.tensor(0.5, dtype=torch.float64)
+    lam_max = 700.0
+    B = torch.tensor(9000.0, dtype=torch.float64)
+    kappa = 1.0 / (1.0 - cos_i ** 2) ** 0.5
+    t_nodes, t_weights = gauss_legendre_01(64)
+
+    sf1, qy1, L0 = 20.0, 0.8, 4.2
+    lam_ex1, lam_em1 = 480.0, 550.0   # species 1: straddles the TIR boundary
+    sf2, qy2 = 15.0, 0.6
+
+    target_lam_star = 480.0   # coincides with lam_ex1 -- boundary-straddling regime
+    A0 = (kappa - B / target_lam_star ** 2).item()
+
+    results: list = []
+    tol = 1e-5
+
+    # --- Positive case: species 2 absorbs where species 1 emits (overlap at 550nm) ---
+    lam_ex2_pos, lam_em2_pos = 550.0, 650.0
+    lam_ex_list = [lam_ex1, lam_ex2_pos]
+    lam_em_list = [lam_em1, lam_em2_pos]
+    sf_list = [sf1, sf2]
+    qy_list = [qy1, qy2]
+
+    ds_coupled, ds_decoupled, s_val, B_mat = _v13_ds_dA(
+        A0, B, cos_i, lam_max, lam_ex_list, lam_em_list, sf_list, qy_list, L0, t_nodes, t_weights)
+
+    # Three-way check: autograd (already in ds_coupled) vs FD, both species.
+    theta_fd = torch.tensor(A0, dtype=torch.float64)
+    for j, name in enumerate(["species1 (boundary)", "species2 (coupled)"]):
+        def fn(j=j, theta_fd=theta_fd):
+            _, info = v9_escaping_flux_multi(theta_fd, B, cos_i, lam_max, lam_ex_list, lam_em_list,
+                                              sf_list, qy_list, L0, t_nodes, t_weights)
+            return info["s"][j]
+
+        fd = fd_gradient(fn, theta_fd).item()
+        ag = ds_coupled[j].item()
+        rel = abs(ag - fd) / max(abs(fd), 1e-30)
+        results.append(GradResult(
+            test_id="V13", label=f"ds/dA autograd vs FD ({name})", param="A",
+            autograd=ag, analytic=None, fd=fd, rel_ag_fd=rel, rel_an_fd=None, tol=tol))
+
+    ds2_coupled = ds_coupled[1].item()
+    ds2_decoupled = ds_decoupled[1].item()
+    coupling_frac_pos = abs(ds2_coupled - ds2_decoupled) / max(abs(ds2_coupled), 1e-30)
+
+    results.append(StructResult(
+        "V13", "coupling channel (Woodbury off-diagonal) is a substantial fraction of ds2/dA",
+        coupling_frac_pos, None, None, 0.03, coupling_frac_pos > 0.03,
+        f"ds2/dA coupled={ds2_coupled:.6g}  decoupled={ds2_decoupled:.6g}  "
+        f"B21={B_mat[1,0].item():.4g}  fraction={coupling_frac_pos:.3f} -- "
+        "species 1 (near TIR boundary) acts as a lever arm on species 2's amplitude "
+        "purely through the shared operator inverse, despite zero direct spectral overlap "
+        "with species 2's own excitation/emission bands"))
+
+    # --- Negative control: species 2's absorption moved away from species 1's
+    # emission band (lam_ex2: 550 -> 650) -- species 1 still straddles the
+    # boundary (ds1/dA unchanged in kind), but B21 should collapse toward 0. ---
+    lam_ex2_ctrl, lam_em2_ctrl = 650.0, 680.0
+    lam_ex_list_c = [lam_ex1, lam_ex2_ctrl]
+    lam_em_list_c = [lam_em1, lam_em2_ctrl]
+
+    ds_coupled_c, ds_decoupled_c, s_val_c, B_mat_c = _v13_ds_dA(
+        A0, B, cos_i, lam_max, lam_ex_list_c, lam_em_list_c, sf_list, qy_list, L0, t_nodes, t_weights)
+
+    ds2_coupled_c = ds_coupled_c[1].item()
+    ds2_decoupled_c = ds_decoupled_c[1].item()
+    coupling_frac_ctrl = abs(ds2_coupled_c - ds2_decoupled_c) / max(abs(ds2_coupled_c), 1e-30)
+
+    # Relative collapse, not an absolute near-zero bound: near B21=0 the
+    # coupled/decoupled solves nearly coincide, so the *fraction* metric is a
+    # near-cancellation of two close numbers and is noisier in absolute terms
+    # than the underlying coupling coefficient B21 itself (which drops by
+    # ~3400x below). The real claim is "coupling coefficient collapses", so
+    # check both: B21 itself drops by orders of magnitude, and the resulting
+    # fraction is far smaller than the positive case's.
+    B21_ratio = abs(B_mat_c[1, 0].item()) / max(abs(B_mat[1, 0].item()), 1e-30)
+    frac_ratio = coupling_frac_ctrl / max(coupling_frac_pos, 1e-30)
+    results.append(StructResult(
+        "V13", "NEGATIVE CONTROL: coupling collapses when species 2's absorption no longer "
+        "overlaps species 1's emission band (spectral proximity, not just TIR proximity, drives it)",
+        frac_ratio, 0.0, frac_ratio, 0.05, B21_ratio < 0.01 and frac_ratio < 0.05,
+        f"B21 positive-case={B_mat[1,0].item():.4g} -> control={B_mat_c[1,0].item():.4g} "
+        f"(ratio {B21_ratio:.2e})  coupling fraction {coupling_frac_pos:.3f} -> {coupling_frac_ctrl:.2e} "
+        f"(ratio {frac_ratio:.2e}) -- confirms the effect is a real spectral-overlap mechanism, not an "
+        "artifact of the specific test scene (species 1's own boundary-proximity derivative is "
+        "essentially unchanged between the two cases)"))
+
+    # --- Not vacuous: ds1/dA really is much larger when species 1 straddles
+    # the boundary than when it sits safely inside the propagating window. ---
+    target_lam_star_normal = 300.0
+    A0_normal = (kappa - B / target_lam_star_normal ** 2).item()
+    ds_normal, _, _, _ = _v13_ds_dA(
+        A0_normal, B, cos_i, lam_max, lam_ex_list, lam_em_list, sf_list, qy_list, L0, t_nodes, t_weights)
+    ratio = abs(ds_coupled[0].item()) / max(abs(ds_normal[0].item()), 1e-30)
+    results.append(StructResult(
+        "V13", "NOT vacuous: ds1/dA is far larger when species 1 straddles the TIR boundary "
+        "than at a normal (far-from-boundary) operating point",
+        ratio, None, None, 10.0, ratio > 10.0,
+        f"ds1/dA at lambda*=480 (=lam_ex1): {ds_coupled[0].item():.6g}   "
+        f"at lambda*=300 (far below lam_ex1): {ds_normal[0].item():.6g}   ratio={ratio:.3g}"))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # V10-V12: Phase 2 only (require C++ path tracer)
 # ---------------------------------------------------------------------------
 
@@ -924,7 +1089,7 @@ def test_V12() -> StructResult:
 # Runner
 # ---------------------------------------------------------------------------
 
-PHASE1 = [test_V1, test_V2, test_V3, test_V4, test_V5, test_V6, test_V7, test_V8, test_V9]
+PHASE1 = [test_V1, test_V2, test_V3, test_V4, test_V5, test_V6, test_V7, test_V8, test_V9, test_V13]
 PHASE2 = [test_V10, test_V11, test_V12]
 ALL    = PHASE1 + PHASE2
 

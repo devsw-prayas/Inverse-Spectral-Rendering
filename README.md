@@ -166,8 +166,9 @@ tensor algebra):
   robustness. Covered in the meantime by G9 and T14.
 
 **V-series — full-scene validation against the forward oracle** (V1, V2, V3,
-V5, V6, V8, V9 run today; V4 and V7 need real Monte Carlo sampling variance
-and are Phase-2 stubs; V10–V12 need the future C++ renderer and are stubbed):
+V5, V6, V8, V9, V13 run today; V4 and V7 need real Monte Carlo sampling
+variance and are Phase-2 stubs; V10–V12 need the future C++ renderer and are
+stubbed):
 - **V1** — a closed cavity containing a TIR interface reaches uniform
   thermal equilibrium (a "furnace test"); isolates a bug specific to the TIR
   limit.
@@ -200,6 +201,14 @@ and are Phase-2 stubs; V10–V12 need the future C++ renderer and are stubbed):
   the C++ implementation against this Python oracle, verify multi-strategy
   sampling is unbiased, and confirm the test suite catches a deliberately
   reintroduced bug.
+- **V13** — *(Phase 1.1 addition, added after the original Phase 1 close)*
+  when two fluorescent species share one TIR-bounded interface, a species
+  sitting near the critical-angle boundary measurably perturbs a second,
+  spectrally distant species' recovered amplitude — purely through the
+  shared Woodbury operator inverse, not any direct spectral overlap between
+  the two species. A negative control (moving the second species' absorption
+  off the first species' emission band) collapses the effect, confirming the
+  mechanism is genuinely spectral-overlap-gated.
 
 ## Environment
 

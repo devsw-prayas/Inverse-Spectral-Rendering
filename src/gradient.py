@@ -446,6 +446,92 @@ def v9_escaping_flux(
 
 
 # ---------------------------------------------------------------------------
+# V13: rank-k Woodbury boundary coupling (Phase 1.1)
+# ---------------------------------------------------------------------------
+#
+# Generalizes v9_escaping_flux's scalar Sherman-Morrison feedback to k
+# fluorescent species sharing ONE TIR-bounded interface (same lambda_star(A,B),
+# same escaping-domain w-substitution -- all species see the same R(lam) and
+# the same moving boundary).
+#
+# K_x = sum_j qy_j * e_j(lam) (x) a_j(lam'). Each species' self-consistent
+# "consumed flux" s_j := qy_j * integral_Omega a_j(lam) L(lam) dlam obeys, by
+# the same (1-R)*G0=1 identity used in v9_escaping_flux:
+#     s_j = b_j + sum_m B[j,m] * s_m
+#     b_j    = qy_j * integral a_j(lam) L_e(lam) / (1-R(lam)) dlam
+#     B[j,m] = qy_j * integral a_j(lam) e_m(lam) / (1-R(lam)) dlam
+# i.e. (I - B) s = b, s = (I-B)^-1 b -- the Woodbury self-consistency system
+# named in the Phase 1.1 addendum (.claude/ref/addendum_rankk_woodbury_coupling.md).
+# B[j,m] is nonzero only when species j's absorption a_j spectrally overlaps
+# species m's emission e_m -- the physical coupling channel (species m's
+# emitted photons get partially reabsorbed by species j).
+#
+# Both b and B share the SAME 1/(lam-lambda_star) singularity as V9's A_int/
+# B_int, fixed the same way (w=sqrt(lam-lambda_star), w=W(theta)*t on a fixed
+# t in [0,1], Gauss-Legendre nodes strictly interior).
+#
+# I(theta) = P + sum_m s_m * Q_m, P/Q_m bounded (ordinary moving-boundary
+# lemma scope) -- not needed by test_V13 itself (which studies s directly)
+# but returned in info for completeness/parity with v9_escaping_flux.
+
+def v9_escaping_flux_multi(
+    A:             torch.Tensor,
+    B:             torch.Tensor,
+    cos_i:         torch.Tensor | float,
+    lam_max:       float,
+    lam_ex_list:   list[float],
+    lam_em_list:   list[float],
+    sigma_f_list:  list[float],
+    qy_list:       list[float],
+    L0:            float,
+    t_nodes:       torch.Tensor,
+    t_weights:     torch.Tensor,
+    polarization:  str = "unpolarized",
+) -> tuple[torch.Tensor, dict]:
+    """k-species Woodbury generalization of v9_escaping_flux.
+
+    Returns (I, info); info carries lam_star, the (k,k) coupling matrix B_mat,
+    source vector b, solved amplitudes s = (I-B_mat)^-1 b, and P/Q_m.
+    """
+    k = len(lam_ex_list)
+    lam_star = lambda_star(A, B, cos_i)
+    W = torch.sqrt(lam_max - lam_star)
+    w = W * t_nodes
+    lam = lam_star + w ** 2
+
+    n = n_cauchy(lam, A, B)
+    v = cos_theta_t(cos_i, n, 1.0)
+    Tv = interface_T_stable(v, n, cos_i, polarization)
+
+    L_e = torch.full_like(lam, L0)
+    dlam = 2.0 * w * t_weights * W
+
+    a_list, e_list = [], []
+    for j in range(k):
+        a_j = torch.exp(-0.5 * ((lam - lam_ex_list[j]) / sigma_f_list[j]) ** 2)
+        e_raw_j = torch.exp(-0.5 * ((lam - lam_em_list[j]) / sigma_f_list[j]) ** 2)
+        e_j = e_raw_j / ((2.0 * torch.pi) ** 0.5 * sigma_f_list[j])
+        a_list.append(a_j)
+        e_list.append(e_j)
+
+    b = torch.stack([qy_list[j] * (dlam * a_list[j] * L_e / Tv).sum() for j in range(k)])
+    B_rows = []
+    for j in range(k):
+        row = torch.stack([qy_list[j] * (dlam * a_list[j] * e_list[m] / Tv).sum() for m in range(k)])
+        B_rows.append(row)
+    B_mat = torch.stack(B_rows, dim=0)
+
+    I_k = torch.eye(k, dtype=torch.float64)
+    s = torch.linalg.solve(I_k - B_mat, b)
+
+    P_val = (dlam * L_e).sum()
+    Q = torch.stack([(dlam * e_list[m]).sum() for m in range(k)])
+    I_val = P_val + (s * Q).sum()
+
+    return I_val, dict(lam_star=lam_star, W=W, B_mat=B_mat, b=b, s=s, P_val=P_val, Q=Q)
+
+
+# ---------------------------------------------------------------------------
 # Levenberg-Marquardt recovery (V5, V6) — nonlinear least-squares over a
 # differentiable forward model, using the same Jacobian machinery the
 # G/T-series conditioning tests already build.
