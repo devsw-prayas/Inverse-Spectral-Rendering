@@ -1,16 +1,15 @@
-"""Three hardcoded scene archetypes for the Python forward oracle.
+"""Scene archetypes for the forward oracle.
 
-All scenes return a ForwardResult containing L, image, and K so that
-gradient assembly in gradient.py can reuse them without re-computation.
+Each returns a ForwardResult with L, image, and K, so gradient assembly in
+gradient.py can reuse them without recomputing.
 
-Scene index
------------
-1  single_bounce_flat       — one thin-film surface, flat illumination
-                              Theorem's degenerate case (rank < 6 for joint recovery)
-2  two_bounce               — thin film + fluorophore, flat illumination
-                              Minimal degeneracy-breaking config (rank 6, D10 baseline)
-3  structured_illumination  — archetype 1 or 2 with structured/parameterized L_e
-                              (pass the desired L_e directly; no separate function needed)
+  single_bounce_flat   one thin-film surface, flat illumination.
+                       Rank-deficient for the 6-parameter joint recovery.
+  two_bounce           thin film plus fluorophore, flat illumination.
+                       Minimal configuration that breaks the degeneracy.
+  film_on_substrate    thin film on a substrate of different index.
+
+For structured illumination, pass the desired L_e directly to any archetype.
 """
 from dataclasses import dataclass
 
@@ -41,7 +40,7 @@ def d65_on_grid(grid: SpectralGrid) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Archetype 1 — single-bounce flat
+# Archetype 1, single-bounce flat
 # ---------------------------------------------------------------------------
 
 def single_bounce_flat(
@@ -60,11 +59,11 @@ def single_bounce_flat(
 
     d, A, B:   film thickness [nm] and Cauchy coefficients (may require_grad).
     cos_i:     scalar cosine of incidence angle.
-    max_depth: bounce depth D — configurable axis per spec §6.1.
+    max_depth: bounce depth.
     L_e:       (N,) source spectrum; defaults to D65 resampled onto grid.
 
-    This scene is provably rank-deficient for the 6-parameter joint recovery
-    (Theorem 7 / D10). Use two_bounce() to break the degeneracy.
+    Rank-deficient for the 6-parameter joint recovery; use two_bounce() to
+    break the degeneracy.
     """
     if L_e is None:
         L_e = d65_on_grid(grid)
@@ -79,7 +78,7 @@ def single_bounce_flat(
 
 
 # ---------------------------------------------------------------------------
-# Archetype 2 — two-bounce: thin film + fluorophore
+# Archetype 2, two-bounce: thin film + fluorophore
 # ---------------------------------------------------------------------------
 
 def two_bounce(
@@ -101,15 +100,15 @@ def two_bounce(
     """Thin film and fluorophore in the same integrating cavity.
 
     Combined operator K = K_TF + K_FL. Each Neumann bounce applies both
-    materials — K^n includes all interleaved thin-film/fluorophore
-    interactions up to depth n. Minimal configuration for rank-6
-    identifiability (D10 S8/S10 baseline).
+    materials, so K^n includes all interleaved thin-film/fluorophore
+    interactions up to depth n. Minimal configuration for 6-parameter
+    identifiability.
 
     d, A, B:       thin-film parameters (may require_grad).
     cos_i:         incidence angle cosine.
     lam_ex/em:     fluorophore excitation/emission centres [nm] (may require_grad).
     sigma_f:       fluorescence linewidth [nm] (may require_grad).
-    max_depth:     bounce depth D — configurable axis per spec §6.1.
+    max_depth:     bounce depth.
     quantum_yield: fraction of absorbed photons re-emitted (≤ 1).
     L_e:           (N,) source; defaults to D65.
     """
@@ -131,7 +130,7 @@ def two_bounce(
 
 
 # ---------------------------------------------------------------------------
-# Archetype 4 — film on a substrate (non-free-standing thin film)
+# Archetype 4, film on a substrate (non-free-standing thin film)
 # ---------------------------------------------------------------------------
 
 def film_on_substrate(
@@ -151,9 +150,9 @@ def film_on_substrate(
     """Thin film on a substrate of different index (3-layer air/film/substrate).
 
     Generalizes single_bounce_flat's free-standing film (r23 = -r12) to a
-    real film-substrate interface: n_s = C_sub + D_sub/lam^2. Substrate-confound
-    regime (T6): as C_sub -> A, r23 -> 0 and d becomes unobservable in R(lam),
-    independent of angle (this archetype is normally evaluated at cos_i near 1).
+    real film-substrate interface: n_s = C_sub + D_sub/lam^2. As C_sub -> A,
+    r23 -> 0 and film thickness becomes unobservable in R(lam), independent of
+    angle (this archetype is normally evaluated at cos_i near 1).
 
     d, A, B:         film thickness [nm] and Cauchy coefficients (may require_grad).
     C_sub, D_sub:    substrate Cauchy coefficients (may require_grad).

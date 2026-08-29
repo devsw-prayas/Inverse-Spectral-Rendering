@@ -1,39 +1,38 @@
 # Differentiable Bispectral Rendering
 
 Research code for a differentiable renderer that correctly handles materials
-that shift light between wavelengths, fluorescence and thin-film interference
-(soap bubbles, oil slicks, iridescent coatings), instead of just reflecting
-each wavelength back at itself.
+which move light from one wavelength to another, fluorescence and thin-film
+interference (soap bubbles, oil slicks, iridescent coatings), rather than
+assuming every wavelength reflects straight back at itself.
 
 ## Why this matters
 
-Most differentiable renderers assume light of wavelength λ only ever scatters
-back out at wavelength λ. That is true for ordinary reflective materials, but
-it breaks down for anything that shifts color: a fluorescent dye absorbs blue
-light and re-emits it as green; a thin film interferes light across
-wavelengths depending on its thickness. Modeling this properly requires a
-scattering kernel `K(λ, λ')` that is *dense*, every input wavelength can
-contribute to every output wavelength, rather than diagonal.
+Most differentiable renderers assume light of wavelength λ only ever comes
+back out at wavelength λ. That holds for ordinary reflective surfaces, but
+not for anything that shifts colour: a fluorescent dye absorbs blue and
+re-emits green; a thin film mixes wavelengths depending on its thickness.
+Handling this needs a scattering description `K(λ, λ')` that is *dense*, any
+incoming wavelength can feed any outgoing wavelength, instead of one that
+only connects each wavelength to itself.
 
-Once the kernel is dense, differentiating the render with respect to a scene
-parameter (say, film thickness or dye concentration) gets subtle. A naive
-automatic-differentiation pass differentiates the integrand but silently
-ignores that the integration domain itself moves as the parameter changes
-(e.g. the total-internal-reflection boundary shifts). That missing term
-produces a gradient that is *wrong*, not just approximate. This project
-derives and validates the correct gradient estimator, including that missing
-domain-motion (velocity) term.
+Once wavelengths are coupled, taking the derivative of a rendered image with
+respect to a scene parameter (film thickness, dye concentration) becomes
+delicate. A naive automatic-differentiation pass differentiates the quantity
+being integrated but misses that the region of integration also moves as the
+parameter changes; for instance, the angle past which light is trapped by
+total internal reflection shifts. The dropped term makes the gradient
+*wrong*, not just inaccurate. This project works out and checks the correct
+gradient, including that missing moving-boundary term.
 
 ## What's here
 
-This repository is a Python research prototype: closed-form derivations
-implemented and cross-checked against automatic differentiation and numerical
-finite differences, all in `float64` for precision. It includes a real
-(deterministic Neumann-series/quadrature, not Monte Carlo) multi-bounce
-forward renderer and sensor model, used throughout the V-series to validate
-gradients on full scenes, not just individual components. There is no
-stochastic path tracer yet; that is the Phase 2 C++ implementation this
-Python oracle is groundwork for.
+A Python research prototype. Each result is derived by hand in closed form
+and then cross-checked against automatic differentiation and finite
+differences, all in `float64`. It includes a real multi-bounce forward
+renderer and sensor model, deterministic (it solves the transport equation
+directly rather than sampling paths), used across the V-series to check
+gradients on whole scenes, not just isolated pieces. There is no random path
+tracer yet; that is the Phase 2 C++ build this code is groundwork for.
 
 ## Repository layout
 
@@ -59,156 +58,145 @@ tests/
 ```
 
 Each test module runs standalone and prints a pass/fail table. Where
-applicable, a test validates a quantity three independent ways: closed-form
-analytic result vs. `torch` automatic differentiation vs. central finite
-differences, and the three should agree to numerical precision.
+applicable, a test checks a quantity three independent ways: the closed-form
+result, `torch` automatic differentiation, and central finite differences,
+which should agree to numerical precision.
 
 ## What each test checks
 
-A few terms used below: **TIR** (total internal reflection) is the point
-where light hitting an interface from the denser side stops transmitting and
-reflects entirely, past a "critical angle." Reflectance/transmittance
-formulas and their derivatives can behave badly right at that boundary if
-they aren't written carefully; several tests exist specifically to check
-that edge.
+**TIR** (total internal reflection) below means the angle past which light
+hitting an interface from the denser side stops passing through and reflects
+completely. Several of the formulas, and their derivatives, are easy to get
+wrong right at that angle; a number of tests exist just to pin that edge down.
 
-**A-series, closed-form proofs** (no numerical rendering; sympy or exact
-tensor algebra):
-- **A1** the thin-film reflectance formula always stays within the
-  physically valid range [0, 1].
-- **A2** a zero-thickness film has no interference effect, and its
-  reflectance-vs-thickness derivative vanishes smoothly there (no kink).
-- **A3** the fluorescence kernel's operator norm bound is achieved exactly
-  at the predicted worst-case input, not just approximately.
-- **A4** the naive (wrong) adjoint kernel only happens to be correct in the
-  trivial case of zero wavelength shift; everywhere else it is provably wrong.
-- **A5** near the TIR critical angle, the transmitted angle vanishes as a
-  square root of distance from the critical point, not linearly.
-- **A6** the refraction Jacobian's components collapse to the expected
-  values at normal incidence, and diverge/vanish correctly near grazing angles.
-- **A7** the refraction Jacobian's two TIR-limit formulas (one per light
-  polarization) agree with each other exactly when there is no index mismatch.
-- **A8** Brewster's angle (where reflectance drops to zero) is a distinct
-  phenomenon from the TIR critical angle; they never coincide.
-- **A9** absorbed fluorescence power goes cleanly to zero as the
-  fluorophore's spectral width shrinks to zero, no artificial floor value.
-- **A10** the critical wavelength's sensitivity to the dispersion
-  parameters behaves consistently as the geometry approaches normal incidence.
-- **A11** the render is symbolically invariant to which excitation
-  wavelength is used, generalized to multiple fluorescent species at once.
-- **A12** the well-posedness bound used elsewhere is sufficient but not
-  necessary: a Cauchy-Schwarz upper bound, not the tight condition, so it can
-  reject scenes that are actually fine.
-- **A13** Monte Carlo sampling-density gradients cancel exactly under the
-  standard estimator design; not a live gap in this repo (no stochastic
-  sampling here yet), carried forward as a correctness requirement for the
-  future C++ tracer.
+**A-series, closed-form proofs** (symbolic algebra, no rendering):
+- **A1** the thin-film reflectance formula never leaves the physical range
+  [0, 1].
+- **A2** a film of zero thickness has no effect, and its
+  reflectance-vs-thickness slope goes smoothly to zero there (no kink).
+- **A3** the largest factor by which the fluorescence kernel can amplify a
+  spectrum matches the predicted bound, and is reached by the input the
+  theory predicts.
+- **A4** the shortcut form of the adjoint kernel is only correct when
+  absorption and emission have the same shape (no wavelength shift);
+  otherwise it is provably wrong.
+- **A5** near the TIR angle the transmitted-ray angle falls off like the
+  square root of the distance from that angle, not linearly.
+- **A6** the refraction Jacobian takes its expected values at straight-on
+  incidence and diverges or vanishes correctly near grazing angles.
+- **A7** the two TIR-limit formulas for the refraction factor (one per
+  polarization) agree exactly when the two media have the same index.
+- **A8** Brewster's angle (where reflection drops to zero) and the TIR angle
+  are different angles and never coincide.
+- **A9** absorbed fluorescence power goes cleanly to zero as the dye's
+  spectral width shrinks, with no spurious floor.
+- **A10** the trapped-light cutoff wavelength responds to the dispersion
+  parameters consistently as the geometry approaches straight-on incidence.
+- **A11** the rendered result does not depend on which excitation wavelength
+  is assumed, for any number of fluorescent species.
+- **A12** the well-posedness condition used elsewhere is safe but
+  conservative: it can reject scenes that would actually be fine.
+- **A13** the sampling-probability terms in a Monte Carlo gradient cancel
+  under the standard estimator; not relevant to this repo yet (no random
+  sampling), noted as a requirement for the future C++ tracer.
 
-**T-series, small numerical checks** (single components, no full scene;
-`T0` is the build gate, run first):
-- **T0** energy conservation: reflected + transmitted power sums to exactly
-  1 at a lossless interface.
-- **T1** the reflectance-as-operator behaves correctly even for wavelengths
-  right at the edge of the sampled spectral range.
-- **T2** demonstrates that "each column of a matrix sums to 1" alone is not
-  enough to bound how much the matrix can amplify a signal (motivates the
-  stability bound actually used elsewhere).
-- **T4** the refraction Jacobian's determinant formula holds on both sides
-  of the TIR critical angle.
-- **T5** the refraction Jacobian stays finite exactly at the TIR onset, but
-  must not be evaluated past it without an explicit guard.
-- **T6** film thickness becomes impossible to recover once the substrate's
-  index of refraction matches the film's (no contrast, no signal).
-- **T9** the recoverability (Jacobian rank) of scene parameters actually
-  drops, not just gets ill-conditioned, when fluorescence width and film
-  thickness both shrink to zero together.
-- **T11** parameter recovery becomes exactly rank-deficient (not just
-  poorly conditioned) when two fluorophores' emission peaks exactly coincide.
+**T-series, small numerical checks** (one component at a time, no full
+scene; `T0` is the build gate):
+- **T0** energy conservation: reflected plus transmitted power is exactly 1
+  at a lossless interface.
+- **T1** the reflectance step behaves correctly even for wavelengths right
+  at the edge of the sampled range.
+- **T2** shows that "every column sums to 1" is not enough to limit how much
+  a matrix can amplify a signal, which is why a stronger condition is used
+  elsewhere.
+- **T4** the refraction determinant formula holds on both sides of the TIR
+  angle.
+- **T5** the refraction factor stays finite exactly at the TIR onset but
+  must not be evaluated past it without a guard.
+- **T6** film thickness becomes impossible to recover once the substrate
+  index matches the film index (no contrast, no signal).
+- **T9** the number of recoverable parameters actually drops, not just gets
+  harder, when fluorescence width and film thickness both shrink to zero.
+- **T11** parameter recovery becomes exactly impossible, not just hard, when
+  two dyes' emission peaks coincide.
 - **T12** a scene with both a near-TIR interface and a moving integration
-  boundary combines both correction terms correctly.
-- **T13** a naive numerical clamp in the code hides a real gradient
-  discontinuity at a substrate-side critical angle.
-- **T14** excitation-wavelength invariance (A11's claim) degrades near the
-  edge of the simulated spectral window, a genuine scope limit, not a bug.
-- **T15** the moving-boundary correction term goes smoothly to zero at
-  normal incidence instead of producing an indeterminate `0 * inf`.
+  edge needs both correction terms, and they combine correctly.
+- **T13** a numerical clamp in the code hides a real gradient jump at a
+  substrate-side TIR angle.
+- **T14** the excitation-wavelength independence from A11 breaks down near
+  the edge of the simulated wavelength window, a real limit, not a bug.
+- **T15** the moving-boundary term goes smoothly to zero at straight-on
+  incidence instead of producing `0 * inf`.
 
-**G-series, parameter sweeps** (each one saves a CSV to
-[`results/figures/`](results/figures) intended to become a paper figure):
-- **G1** full sweep confirming the TIR-limit Jacobian formula lands exactly
-  on its predicted value for both polarizations, with no kink.
+**G-series, parameter sweeps** (each saves a CSV to
+[`results/figures/`](results/figures) meant to become a paper figure):
+- **G1** confirms the TIR-limit refraction formula lands exactly on its
+  predicted value for both polarizations, with no kink.
 - **G2** refraction Jacobian components swept over incidence angle for
   several index ratios.
-- **G3** the gradient stays smooth and continuous as the critical
-  wavelength sweeps across the edges of the measurement window.
-- **G4** recovery conditioning worsens smoothly (no plateau) as two
-  fluorophore emission peaks are moved closer together.
-- **G5** a heatmap of recovery conditioning over emission-peak separation
-  and number of fluorescent species.
-- **G6** adding more measurement angles improves parameter recoverability,
-  with diminishing returns.
-- **G7** how recovery conditioning behaves as substrate/film index
-  contrast shrinks toward zero.
-- **G8** recovery conditioning vs. film thickness shows periodic structure
-  tied to the interference fringe spacing.
-- **G9** sensitivity of absorbed power to excitation wavelength grows
-  smoothly from exactly zero (not with a jump).
-- **G10** how many scene parameters are recoverable as a function of
-  measurement spectral bandwidth.
-- **G11** using the wrong (transposed) adjoint kernel produces a gradient
-  error that grows with the fluorescence wavelength shift, vanishing only
-  when there is no shift at all.
-- **G12** *(deferred to Phase 2)* would confirm excitation-wavelength
-  invariance in a rendered image within Monte Carlo noise, but there is no
-  stochastic estimator in this repo yet to generate that noise; a toy
-  wrapper around the existing closed form would just show a flat line,
-  testing "noise around a known constant" rather than real estimator
-  robustness. Covered in the meantime by G9 and T14.
+- **G3** the gradient stays smooth as the trapped-light cutoff wavelength
+  sweeps across the edges of the measurement window.
+- **G4** how ill-determined recovery gets as two dye emission peaks are
+  brought together (smoothly worse, no plateau).
+- **G5** a heatmap of recovery difficulty over emission-peak spacing and
+  number of dyes.
+- **G6** more measurement angles make parameters easier to recover, with
+  diminishing returns.
+- **G7** how recovery difficulty behaves as substrate/film index contrast
+  goes to zero.
+- **G8** recovery difficulty vs. film thickness shows periodic structure
+  matching the interference fringe spacing.
+- **G9** the sensitivity of absorbed power to excitation wavelength grows
+  smoothly from exactly zero, with no jump.
+- **G10** how many parameters are recoverable as the measured wavelength
+  band widens.
+- **G11** using the wrong (transposed) adjoint kernel gives a gradient error
+  that grows with the fluorescence wavelength shift and vanishes only when
+  there is no shift.
+- **G12** *(deferred to Phase 2)* would check excitation-wavelength
+  independence in a rendered image under Monte Carlo noise, but there is no
+  random estimator here yet; a toy version would only test noise around a
+  known constant. Covered for now by G9 and T14.
 
-**V-series, full-scene validation against the forward oracle** (V1, V2, V3,
-V5, V6, V8, V9, V13 run today; V4 and V7 need real Monte Carlo sampling
-variance and are Phase-2 stubs; V10-V12 need the future C++ renderer and are
-stubbed):
-- **V1** a closed cavity containing a TIR interface reaches uniform
-  thermal equilibrium (a "furnace test"); isolates a bug specific to the TIR
-  limit.
-- **V2** a rendered image is exactly unchanged by excitation-wavelength
-  shifts in a flat-illuminated, single-bounce fluorescent scene.
+**V-series, whole-scene checks against the forward renderer** (V1, V2, V3,
+V5, V6, V8, V9, V13 run today; V4 and V7 need real sampling noise and are
+Phase-2 stubs; V10-V12 need the future C++ renderer):
+- **V1** a sealed cavity with a TIR interface settles to a uniform
+  temperature (a "furnace test"); catches bugs specific to the TIR limit.
+- **V2** a rendered image is exactly unchanged when the assumed excitation
+  wavelength is shifted, in a flat-lit single-bounce fluorescent scene.
 - **V3** on a full scene, automatic differentiation, the correct adjoint
-  gradient, and finite differences all agree, for every parameter; the wrong
+  gradient, and finite differences all agree for every parameter; the wrong
   adjoint fails on all of them.
-- **V4** *(Phase 2, needs real sampling variance)* naive vs. corrected
-  gradient near criticality combined with a moving critical wavelength.
-- **V5** gradient-descent (Levenberg-Marquardt) parameter recovery variance
-  under measurement noise matches what the Jacobian's conditioning predicts,
-  for both the substrate-confound and the B-bottleneck cases.
-- **V6** an "inverse crime" check: fitting a bounce-depth-truncated model to
-  data generated by the true (converged multi-bounce) model shows a
-  structurally bad fit, confirming V5's recovery success was not circular.
+- **V4** *(Phase 2, needs real sampling noise)* naive vs. corrected gradient
+  near the TIR angle together with a moving cutoff wavelength.
+- **V5** parameter recovery under measurement noise scatters the way the
+  problem's conditioning predicts, for both the substrate-confound and the
+  hard-to-recover-B cases.
+- **V6** an "inverse crime" check: fitting a shortened-bounce model to data
+  from the full model gives a structurally bad fit, so V5's success was not
+  circular.
 - **V7** *(Phase 2, needs real sampling strategies)* compares three
-  gradient-estimator designs for bias near the singular (TIR/rank-deficient)
-  manifold.
-- **V8** checks for spurious beat-pattern aliasing in an actual rendered
-  image when film thickness is swept near resonance with the wavelength
-  sampling; none found, at any production sampling rate.
-- **V9** the full end-to-end falsifier: a fluorescent-behind-glass scene
-  with the critical wavelength swept through the emission band. The naive
-  boundary-only correction breaks down right at the boundary itself (an
-  integrable singularity in the escaping flux); fixed via a second
-  substitution that maps the singular integral onto a fixed, smooth domain
-  so automatic differentiation handles it directly.
-- **V10-V12** *(Phase 2, require the future C++ path tracer)* cross-check
-  the C++ implementation against this Python oracle, verify multi-strategy
-  sampling is unbiased, and confirm the test suite catches a deliberately
-  reintroduced bug.
-- **V13** *(Phase 1.1 addition)* when two fluorescent species share one
-  TIR-bounded interface, a species sitting near the critical-angle boundary
-  measurably perturbs a second, spectrally distant species' recovered
-  amplitude, purely through the shared Woodbury operator inverse, not any
-  direct spectral overlap between the two species. A negative control
-  (moving the second species' absorption off the first species' emission
-  band) collapses the effect, confirming the mechanism is spectral-overlap-
-  gated.
+  gradient-estimator designs for bias near the difficult (TIR /
+  hard-to-recover) region.
+- **V8** looks for spurious beat patterns in a rendered image when film
+  thickness is swept near resonance with the wavelength sampling; none
+  found, at any production sampling rate.
+- **V9** the main end-to-end falsifier: a fluorescent-behind-glass scene
+  with the cutoff wavelength swept through the emission band. The simple
+  boundary correction breaks down right at the boundary (the escaping light
+  is infinite there, but integrably so); fixed with a change of variable
+  that turns the singular integral into a smooth one automatic
+  differentiation can handle.
+- **V10-V12** *(Phase 2, need the C++ path tracer)* cross-check the C++
+  build against this Python version, check that multi-strategy sampling is
+  unbiased, and confirm the suite catches a deliberately reintroduced bug.
+- **V13** *(Phase 1.1)* when two fluorescent species share one TIR-bounded
+  interface, a species sitting near the TIR angle measurably shifts a
+  second, spectrally distant species' recovered brightness, purely through
+  the shared feedback in the solver, not any direct spectral overlap. A
+  control that moves the second species' absorption off the first's emission
+  band removes the effect.
 
 ## Environment
 

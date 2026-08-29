@@ -24,7 +24,7 @@ def kernel_fluorescence(
     e(λ)  = Gaussian emission centered at lam_em, normalized so Σ_i e_i w_i = 1
     weights: (N,) quadrature weights (λ²Δν̃ trapezoid)
 
-    Convention: lam_em > lam_ex (Stokes — emission is red-shifted).
+    Convention: lam_em > lam_ex (Stokes, emission is red-shifted).
     Returns (N, N).
     """
     a = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)           # (N,)
@@ -35,7 +35,7 @@ def kernel_fluorescence(
 
 
 # ---------------------------------------------------------------------------
-# Thin-film (Fabry-Airy) kernel — internal helpers
+# Thin-film (Fabry-Airy) kernel, internal helpers
 # ---------------------------------------------------------------------------
 
 def _fabry_airy_pol(r12: torch.Tensor, phi: torch.Tensor, r23: torch.Tensor | None = None) -> torch.Tensor:
@@ -124,8 +124,9 @@ def fabry_airy_R_substrate(
     """Fabry-Airy power reflectance for a thin film on a substrate (air/film/substrate).
 
     Generalizes fabry_airy_R (free-standing, r23 = -r12) to a real film-substrate
-    interface with its own Cauchy index n_s = C_sub + D_sub/λ². Substrate-confound
-    regime (T6): as C_sub -> A, r23 -> 0 and d becomes unobservable in R(λ).
+    interface with its own Cauchy index n_s = C_sub + D_sub/λ². As C_sub -> A,
+    r23 -> 0 and film thickness becomes unobservable in R(λ) (the substrate
+    confound).
 
     TIR is checked at both interfaces (air->film and film->substrate).
     Returns R (N,) in [0, 1].
@@ -185,10 +186,10 @@ def fabry_airy_dR_dd(
     B: torch.Tensor | float,
     polarization: str = "unpolarized",
 ) -> torch.Tensor:
-    """Analytic ∂R/∂d for air-film-air thin film (Eq. 15).
+    """Analytic ∂R/∂d for a free-standing thin film.
 
     φ = 4π n cosθ_t d / λ  →  ∂φ/∂d = 4π n cosθ_t / λ
-    TIR wavelengths → 0 (gradient dead zone).  Returns (N,).
+    TIR wavelengths → 0 (gradient dead zone). Returns (N,).
     """
     n     = n_cauchy(lam, A, B)
     cos_t = cos_theta_t(cos_i, 1.0, n)
@@ -208,7 +209,7 @@ def fabry_airy_dR_dA(
 ) -> torch.Tensor:
     """∂R_i/∂A for each wavelength via exact Jacobian through fabry_airy_R.
 
-    Uses torch.autograd.functional.jacobian — captures both the phase term
+    Uses torch.autograd.functional.jacobian, captures both the phase term
     ∂R/∂φ · ∂φ/∂A and the amplitude term ∂R/∂r12 · ∂r12/∂A. Returns (N,).
     """
     A_t = torch.tensor(float(A), dtype=lam.dtype, requires_grad=True)
@@ -241,7 +242,7 @@ def fabry_airy_dR_dB(
 
 
 # ---------------------------------------------------------------------------
-# Well-posedness check (H_wp, §3)
+# Well-posedness check (H_wp)
 # ---------------------------------------------------------------------------
 
 def check_hwp(
@@ -297,8 +298,8 @@ def kernel_thinfilm(
     cos_i_is_vec = isinstance(cos_i, torch.Tensor) and cos_i.shape == (N,)
 
     if cos_i_is_vec:
-        lam_i = lam.unsqueeze(1).expand(N, N)          # (N, N) — output wavelength
-        cos_i_j = cos_i.unsqueeze(0).expand(N, N)      # (N, N) — incidence from λ_j path
+        lam_i = lam.unsqueeze(1).expand(N, N)          # (N, N), output wavelength
+        cos_i_j = cos_i.unsqueeze(0).expand(N, N)      # (N, N), incidence from λ_j path
 
         n_i = n_cauchy(lam_i, A, B)
         cos_t = cos_theta_t(cos_i_j, 1.0, n_i)

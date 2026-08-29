@@ -26,7 +26,7 @@ def cos_theta_t(cos_theta_i: torch.Tensor, n_i: torch.Tensor | float, n_t: torch
     """cosθ_t from Snell's law: cos θ_t = sqrt(1 - (n_i/n_t)² (1 - cos²θ_i)).
 
     Returns real values in (0, 1] for propagating rays, 0.0 at TIR onset,
-    and imaginary-magnitude values (returned as 0.0) for TIR wavelengths —
+    and imaginary-magnitude values (returned as 0.0) for TIR wavelengths -
     caller checks via is_tir().
     """
     sin2_i = 1.0 - cos_theta_i ** 2

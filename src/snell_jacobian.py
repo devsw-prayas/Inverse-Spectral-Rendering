@@ -19,7 +19,7 @@ def refracted_direction(
 
     omega_i: (..., 3)
     cos_i:   (...) or (N,)
-    cos_t:   (...) or (N,)  — from cauchy_ior.cos_theta_t()
+    cos_t:   (...) or (N,), from cauchy_ior.cos_theta_t()
     n_i, n_t: scalar or (N,)
     n_hat:   (3,)
     Returns: same leading shape as omega_i, last dim 3.
@@ -35,16 +35,16 @@ def snell_jacobian(
     cos_t: torch.Tensor,
     n_hat: torch.Tensor,
 ) -> torch.Tensor:
-    """∂ω_t/∂ω_i — Lemma 1 Snell Jacobian.
+    """Snell refraction Jacobian ∂ω_t/∂ω_i.
 
     J = (n_i/n_t) [I₃ − (1 − n_i cosθ_i / (n_t cosθ_t)) n̂n̂ᵀ]
 
-    Diverges as cosθ_t → 0 (TIR onset). Call snell_jacobian_tir_safe()
+    Diverges as cosθ_t → 0 (TIR onset). Use snell_jacobian_tir_safe()
     for wavelengths near or at the critical angle.
 
     n_i, n_t: (N,)
     cos_i:    (N,) or broadcastable scalar
-    cos_t:    (N,)  — must not be zero (no TIR wavelengths)
+    cos_t:    (N,), must not be zero (no TIR wavelengths)
     n_hat:    (3,)
     Returns:  (N, 3, 3)
     """
@@ -67,13 +67,10 @@ def solid_angle_ratio(
     cos_i: torch.Tensor,
     cos_t: torch.Tensor,
 ) -> torch.Tensor:
-    """Solid angle ratio |dω_t / dω_i| = (n_i/n_t)² cosθ_i / cosθ_t.
+    """Solid-angle ratio |dω_t / dω_i| = (n_i/n_t)² cosθ_i / cosθ_t.
 
-    This is the 2-D Jacobian of the sphere map ω_i → ω_t (eigenvalue of the
-    tangential block of the 3×3 Snell Jacobian, squared and divided by the
-    normal eigenvalue).
-
-    Diverges at TIR (cosθ_t → 0). Returns (N,).
+    The 2-D Jacobian of the direction-sphere map ω_i → ω_t. Diverges at TIR
+    (cosθ_t → 0). Returns (N,).
     """
     return (n_i / n_t) ** 2 * cos_i / cos_t
 
@@ -85,26 +82,23 @@ def tir_jacobian(
     cos_i: torch.Tensor,
     polarization: str = "unpolarized",
 ) -> torch.Tensor:
-    """TIR-safe scalar J_TIR(v) = f_BTDF(v) · η²c/v  (Theorem 3).
+    """TIR-safe throughput J_TIR(v) = [T_Fresnel(v) / η²] · η²c/v.
 
-    f_BTDF(v) = T_Fresnel(v) / η² is the physically complete BTDF throughput,
-    including the n²-law radiance-compression factor across the refracting
-    interface (Veach 1997 §5.2 non-symmetric scattering) — not bare Fresnel
-    power transmittance. The η² cancels exactly against the solid-angle det's
-    own η² (see solid_angle_ratio), leaving J_TIR = T_Fresnel(v) · c/v.
+    The BTDF throughput carries the n²-law radiance-compression factor 1/η²,
+    which cancels the η² in the solid-angle Jacobian, leaving T_Fresnel(v)·c/v.
+    The 0×∞ at v = cosθ_t → 0 resolves to a finite limit:
 
-    The 0×∞ at v = cosθ_t → 0 resolves analytically to a finite limit:
         J_TIR^s(0) = 4/η,   J_TIR^p(0) = 4η
 
-    Closed forms (real-analytic at v = 0):
+    Closed forms, real-analytic at v = 0:
+
         J_TIR^s(v) = 4ηc² / (ηc + v)²
         J_TIR^p(v) = 4ηc² / (c + ηv)²
 
-    Derived from T_s = 4ηcv/(ηc+v)² and T_p = 4ηcv/(c+ηv)², divided by η²
-    (radiance compression) and multiplied by the solid-angle det η²c/v — the
-    v and one power of η² cancel exactly, leaving rational forms.
+    from T_s = 4ηcv/(ηc+v)², T_p = 4ηcv/(c+ηv)²: the v and one power of η²
+    cancel, leaving rational functions.
 
-    v:     (N,)  cosθ_t, must be ≥ 0 (TIR wavelengths should be masked by caller)
+    v:     (N,) cosθ_t, must be ≥ 0 (caller masks TIR wavelengths)
     n_i, n_t, cos_i: (N,)
     Returns (N,).
     """
@@ -125,21 +119,19 @@ def snell_jacobian_tir_safe(
     n_t:   torch.Tensor,
     n_hat: torch.Tensor,
 ) -> torch.Tensor:
-    """TIR-safe combined factor F(v) = J(v) · |∂cosθ_i/∂v|, substitution v = cosθ_t.
+    """TIR-safe combined factor F(v) = J(v) · |∂cosθ_i/∂v|, with v = cosθ_t.
 
-    Theorem 3: substituting v = cosθ_t into the gradient integral removes the
-    1/cosθ_t singularity. The combined factor is:
+    Working in v = cosθ_t removes the 1/cosθ_t singularity from the gradient
+    integral. The combined factor is:
 
         F(v) = α (I − n̂n̂ᵀ) + β n̂n̂ᵀ
         η     = n_i / n_t
-        α     = v / (η · cosθ_i(v))      tangential eigenvalue
-        β     = 1                         normal eigenvalue (singularities cancel)
+        α     = v / (η · cosθ_i(v))      tangential
+        β     = 1                         normal (the singular parts cancel)
         cosθ_i(v) = sqrt(n_i² − n_t²(1 − v²)) / n_i
 
-    Derivation: J tangential = η, J normal = η² cosθ_i/v,
-    |∂cosθ_i/∂v| = v/(η² cosθ_i); multiplying gives α and β above.
-
-    At v = 0 (TIR onset):  F(0) = n̂n̂ᵀ  — finite.
+    J tangential = η, J normal = η² cosθ_i/v, |∂cosθ_i/∂v| = v/(η² cosθ_i);
+    the product gives α and β above. At v = 0, F(0) = n̂n̂ᵀ (finite).
 
     v:         (N,) cosθ_t values in [0, 1]
     n_i, n_t:  (N,)

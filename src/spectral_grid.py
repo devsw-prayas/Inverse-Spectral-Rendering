@@ -35,7 +35,7 @@ def make_grid(
     ----------
     lam_min, lam_max : wavelength range [nm].  Endpoints are parameters, not constants.
     A, B             : Cauchy coefficients  n(λ) = A + B/λ²  (λ in nm, B in nm²).
-    d_max            : maximum film thickness [nm] — sets the Nyquist requirement.
+    d_max            : maximum film thickness [nm], sets the Nyquist requirement.
     oversampling     : safety factor on top of the Nyquist minimum (≥ 1).
 
     Derivation

@@ -22,11 +22,11 @@ def fd_gradient(
 
     fn:    callable returning a scalar tensor; called with param at its
            current value. Must not close over any other requires_grad tensors
-           that depend on param — use torch.no_grad() internally if needed.
-    param: 0-dim (scalar) tensor — temporarily perturbed in place.
+           that depend on param, use torch.no_grad() internally if needed.
+    param: 0-dim (scalar) tensor, temporarily perturbed in place.
     h:     step; defaults to max(1e-6 |param|, 1e-6). At float64, roundoff
            error ε/h dominates at this step size, giving a realistic FD
-           floor of ~1e-9 relative error — not ~h² ≈ 1e-12 (truncation only).
+           floor of ~1e-9 relative error, not ~h² ≈ 1e-12 (truncation only).
 
     Returns a detached scalar tensor.
     """
@@ -55,12 +55,12 @@ def neumann_adjoint(
 ) -> torch.Tensor:
     """Adjoint Neumann sum: G = Σ_{k=0}^{max_depth} (T^T)^k g.
 
-    G is the adjoint radiance — converges to (I − T^T)^{-1} g for ρ(T) < 1.
+    G is the adjoint radiance, converges to (I − T^T)^{-1} g for ρ(T) < 1.
     Must match the max_depth used in the primal neumann_forward call.
 
     T:         (N, N) operator matrix (same as primal)
-    g:         (N,)   ∂loss / ∂L  — gradient of the scalar loss w.r.t. L
-    max_depth: D — number of adjoint bounces
+    g:         (N,)   ∂loss / ∂L , gradient of the scalar loss w.r.t. L
+    max_depth: D, number of adjoint bounces
     Returns G  (N,)
     """
     G    = g
@@ -86,7 +86,7 @@ def kernel_gradient(
     """Analytic ∂loss/∂θ = G^T · (∂T/∂θ) · L.
 
     Exact in the limit max_depth → ∞; error ∝ ρ(T)^max_depth.
-    At max_depth = 32 and ρ ≲ 0.4, error < 10^{-18} — below float64 floor.
+    At max_depth = 32 and ρ ≲ 0.4, error < 10^{-18}, below float64 floor.
 
     T:        (N, N) operator matrix
     dT_dtheta:   (N,) or (N, N)
@@ -94,7 +94,7 @@ def kernel_gradient(
               Pass (N, N) for dense ∂T/∂θ (fluorescence rank-1 matrices).
     L_e:      (N,) source radiance
     g:        (N,) ∂loss/∂L  (e.g. S^T @ ones(M) for loss = image.sum())
-    max_depth: D — must match the primal forward call
+    max_depth: D, must match the primal forward call
 
     Returns a detached scalar.
 
@@ -127,7 +127,7 @@ def kernel_gradient_wrong_adjoint(
     Equals the correct gradient only when T = T^T (zero Stokes shift).
     For fluorescence with a Stokes shift, gives ~half the correct value.
 
-    Same signature as kernel_gradient — swap in to isolate the bug.
+    Same signature as kernel_gradient, swap in to isolate the bug.
     """
     L = neumann_forward(T, L_e, max_depth)
     if dT_dtheta.dim() == 1:
@@ -139,7 +139,7 @@ def kernel_gradient_wrong_adjoint(
 
 
 # ---------------------------------------------------------------------------
-# Wrong-gradient oracle — Test B7-spectral / C8
+# Wrong-gradient oracle
 # ---------------------------------------------------------------------------
 
 def kernel_fluorescence_half_attached(
@@ -150,20 +150,20 @@ def kernel_fluorescence_half_attached(
     weights:      torch.Tensor,
     quantum_yield: float = 1.0,
 ) -> torch.Tensor:
-    """Half-attached fluorescence kernel — biased gradient oracle for B7.
+    """Deliberately biased fluorescence kernel for the half-attached test.
 
     Identical to kernel_fluorescence except the normalization constant
     C = (e_raw · w).sum() is detached before dividing. Autograd therefore
     misses the quotient-rule term -e · ∂C/∂lam_em / C and returns a biased
-    ∂loss/∂lam_em. The discrepancy vs the correct gradient isolates the
-    'position-velocity' bias in Zeltner-style half-attached estimators.
+    ∂loss/∂lam_em. The gap against the correct gradient is the bias of a
+    half-attached estimator that detaches the normalization.
 
-    All parameters and return shape are the same as kernel_fluorescence.
+    Same parameters and return shape as kernel_fluorescence.
     """
     a     = torch.exp(-0.5 * ((lam - lam_ex) / sigma_f) ** 2)    # (N,)
     e_raw = torch.exp(-0.5 * ((lam - lam_em) / sigma_f) ** 2)    # (N,)
 
-    # Detach C: gradient treats normalization as a constant — the bias source.
+    # Detach C: gradient treats normalization as a constant, the bias source.
     C = (e_raw * weights).sum().detach()
     e = e_raw / C                                                   # norm missing from graph
 
@@ -183,7 +183,7 @@ def fluorescence_dK_dlam_em(
     weights: torch.Tensor,
     quantum_yield: float = 1.0,
 ) -> torch.Tensor:
-    """Analytic ∂K_fl/∂lam_em — (N, N) matrix, quotient-rule correct.
+    """Analytic ∂K_fl/∂lam_em, (N, N) matrix, quotient-rule correct.
 
     ∂e/∂lam_em = (1/C) [∂e_raw/∂lam_em - e · ∂C/∂lam_em]
     where ∂e_raw_i/∂lam_em = e_raw_i · (λ_i - lam_em) / σ²
@@ -213,7 +213,7 @@ def fluorescence_dK_dlam_ex(
     weights: torch.Tensor,
     quantum_yield: float = 1.0,
 ) -> torch.Tensor:
-    """Analytic ∂K_fl/∂lam_ex — (N, N) matrix.
+    """Analytic ∂K_fl/∂lam_ex, (N, N) matrix.
 
     Only the absorption profile a(λ') changes; emission e(λ) is independent.
     ∂a_j/∂lam_ex = a_j · (λ_j − lam_ex) / σ²
@@ -237,7 +237,7 @@ def fluorescence_dK_dsigma_f(
     weights: torch.Tensor,
     quantum_yield: float = 1.0,
 ) -> torch.Tensor:
-    """Analytic ∂K_fl/∂sigma_f — (N, N) matrix.
+    """Analytic ∂K_fl/∂sigma_f, (N, N) matrix.
 
     Both a and e (through C) change.
     ∂a/∂σ  = a · (λ−lam_ex)² / σ³
@@ -265,7 +265,7 @@ def fluorescence_dK_dsigma_f(
 
 
 # ---------------------------------------------------------------------------
-# Moving-boundary gradient (§13) — scope {A, B} only
+# Moving-boundary gradient, scope {A, B} only
 # ---------------------------------------------------------------------------
 
 def lambda_star(
@@ -305,7 +305,7 @@ def moving_boundary_grad(
 ) -> torch.Tensor:
     """Moving-boundary contribution to ∂I/∂θ: −e(λ*) · dλ*/dθ.
 
-    Scope: θ ∈ {A, B} only — the only parameters that move the critical
+    Scope: θ ∈ {A, B} only, the only parameters that move the critical
     wavelength λ*. Returns a scalar. e_at_star is the (normalized) emission
     profile evaluated at λ*; dlam_star_dtheta from dlambda_star_dA/dB.
     """
@@ -313,50 +313,33 @@ def moving_boundary_grad(
 
 
 # ---------------------------------------------------------------------------
-# V9: moving-boundary Leibniz term at full multi-bounce scene complexity
+# V9: moving-boundary gradient at full multi-bounce scene complexity
 # ---------------------------------------------------------------------------
 #
-# Scene: fluorescence (K_fl, rank-1) living inside a dispersive medium behind
-# a single TIR-bounded interface (K_e = diag(R(lam)), plain Fresnel R -- no
-# thin-film oscillation here). Solved exactly (Sherman-Morrison, not a
-# truncated Neumann series) on the propagating-only subset Omega =
-# {lam : lam > lambda_star(A,B)}, matching V1 Check 5/6's precedent that this
-# restriction is well-posed even as R -> 1 at the boundary.
+# Fluorescence inside a dispersive medium behind one TIR-bounded interface,
+# solved on the propagating set Omega = {lam : lam > lambda_star(A,B)}. There
+# the elastic resolvent G0 = (I - diag(R))^-1 is diagonal, so (1-R)*G0 = 1
+# and the escaping-flux density collapses to
+#     phi(lam) = L_e(lam) + e(lam) * c,   c = qy*A_int / (1 - qy*B_int)
+# with A_int, B_int the integrals of a / (1-R) against L_e and e. Near
+# lambda_star, 1-R ~ sqrt(lam - lambda_star), so A_int and B_int carry an
+# integrable 1/sqrt singularity at the moving endpoint.
 #
-# Since G0 := (I - diag(R))^-1 is diagonal, (1-R)*G0 = 1 exactly, so the
-# escaping-flux density collapses to phi(lam) = L_e(lam) + e(lam)*c, with the
-# feedback amplitude c = qy*A_int/(1 - qy*B_int) (Sherman-Morrison scalar for
-# the rank-1 K_fl = e (x) v term). The measured quantity is
-#     I(theta) = integral_{lambda_star(theta)}^{lam_max} phi(lam) dlam = P + c*Q
-# P, Q (bare L_e, e integrals) are smooth/bounded -- their moving-boundary
-# term is exactly the already-locked lambda_star/moving_boundary_grad lemma
-# above. But A_int, B_int (integrals of a(lam')/(1-R(lam')) against L_e, e)
-# have an INTEGRABLE 1/sqrt(lam'-lambda_star) singularity right at the moving
-# boundary itself (1-R ~ v ~ sqrt(lam'-lambda_star) near the critical
-# wavelength) -- the moving-boundary lemma assumes a BOUNDED integrand there,
-# so it only applies directly to P and Q, not A_int/B_int.
-#
-# Fix: substitute w = sqrt(lam - lambda_star(theta)), then w = W(theta)*t,
-# t in [0,1], W(theta) = sqrt(lam_max - lambda_star(theta)). dlam = 2w dw
-# cancels the leading 1/w blowup exactly, AND fixes the integration domain to
-# [0,1] so autograd differentiates straight through
-# theta -> lambda_star(theta) -> the integrand, recovering both the boundary
-# term and the interior R(lam;theta) dependence automatically -- no
-# hand-assembled Leibniz term needed for A_int/B_int. Quadrature uses
-# Gauss-Legendre nodes on the OPEN interval (0,1) (via Golub-Welsch
-# eigendecomposition, pure torch, no numpy) -- critically, none of the nodes
-# land on the endpoint t=0, which is a removable-but-literal 0/0 at the exact
-# critical wavelength (1-R and dlam/dw both vanish there).
+# Fix: substitute w = sqrt(lam - lambda_star(theta)) and rescale to a fixed
+# t in [0,1] via w = W(theta)*t, W = sqrt(lam_max - lambda_star). The
+# dlam = 2w dw Jacobian cancels the 1/sqrt, the lower limit becomes t = 0 for
+# every theta, and plain autograd differentiates through the whole integrand.
+# Quadrature uses Gauss-Legendre nodes on the open interval (0,1) so none
+# lands on t = 0, where 1-R and dlam/dw both vanish.
 # ---------------------------------------------------------------------------
 
 def gauss_legendre_01(n: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Gauss-Legendre quadrature nodes/weights on the open interval (0, 1).
 
     Nodes are eigenvalues of the tridiagonal Jacobi matrix for Legendre
-    polynomials (Golub-Welsch); weights come from the first component of each
-    eigenvector. All nodes are strictly interior to (0, 1) -- unlike a
-    Simpson/trapezoid rule, none lands on an endpoint, which matters when
-    t=0 is a removable-but-literal singularity (see module comment above).
+    polynomials (Golub-Welsch); weights are the squared first component of
+    each eigenvector. All nodes are strictly interior to (0, 1), so none
+    lands on the removable singularity at t = 0.
     """
     k = torch.arange(1, n, dtype=torch.float64)
     beta = k / torch.sqrt(4.0 * k ** 2 - 1.0)
@@ -374,10 +357,9 @@ def interface_T_stable(
 ) -> torch.Tensor:
     """Stable T(v) = 1 - R for a single dielectric interface, v = cosθ_t.
 
-    Same cancellation landmine as G1/tir_jacobian: naive 1 - r² loses several
-    orders of magnitude near v -> 0 (r -> 1, r² computed near 1, subtracted
-    from 1). Uses the rational form directly instead (numerator explicitly
-    O(v), no subtraction of near-equal quantities):
+    Computing 1 - r² directly loses precision near v -> 0 (r -> 1, so r² is
+    subtracted from a nearly equal 1). This uses the rational form instead,
+    with the numerator explicitly O(v):
         T_s(v) = 4ηcv / (ηc + v)²,   T_p(v) = 4ηcv / (c + ηv)²
     """
     c   = cos_i
@@ -408,11 +390,11 @@ def v9_escaping_flux(
 
     θ ∈ {A, B} enters only through λ*(θ); w = √(λ−λ*), w = W(θ)·t maps the
     moving domain to a fixed t ∈ [0,1] (see module comment). Differentiable
-    end to end via plain torch autograd — both the λ_max boundary term (via
+    end to end via plain torch autograd, both the λ_max boundary term (via
     W(θ)) and the interior R(λ;θ) dependence come out automatically.
 
     L_e is a flat illuminant (constant L0); a, e are the usual peak-1 /
-    unit-integral Gaussians (continuum normalization √(2π)σ_f — exact, no
+    unit-integral Gaussians (continuum normalization √(2π)σ_f, exact, no
     grid needed).
 
     Returns (I, info); info carries lam_star, W, and the A_int/B_int/P/Q/c
@@ -446,33 +428,22 @@ def v9_escaping_flux(
 
 
 # ---------------------------------------------------------------------------
-# V13: rank-k Woodbury boundary coupling (Phase 1.1)
+# V13: rank-k Woodbury boundary coupling
 # ---------------------------------------------------------------------------
 #
-# Generalizes v9_escaping_flux's scalar Sherman-Morrison feedback to k
-# fluorescent species sharing ONE TIR-bounded interface (same lambda_star(A,B),
-# same escaping-domain w-substitution -- all species see the same R(lam) and
-# the same moving boundary).
-#
-# K_x = sum_j qy_j * e_j(lam) (x) a_j(lam'). Each species' self-consistent
-# "consumed flux" s_j := qy_j * integral_Omega a_j(lam) L(lam) dlam obeys, by
-# the same (1-R)*G0=1 identity used in v9_escaping_flux:
-#     s_j = b_j + sum_m B[j,m] * s_m
-#     b_j    = qy_j * integral a_j(lam) L_e(lam) / (1-R(lam)) dlam
-#     B[j,m] = qy_j * integral a_j(lam) e_m(lam) / (1-R(lam)) dlam
-# i.e. (I - B) s = b, s = (I-B)^-1 b -- the Woodbury self-consistency system
-# named in the Phase 1.1 addendum (.claude/ref/addendum_rankk_woodbury_coupling.md).
-# B[j,m] is nonzero only when species j's absorption a_j spectrally overlaps
-# species m's emission e_m -- the physical coupling channel (species m's
-# emitted photons get partially reabsorbed by species j).
-#
-# Both b and B share the SAME 1/(lam-lambda_star) singularity as V9's A_int/
-# B_int, fixed the same way (w=sqrt(lam-lambda_star), w=W(theta)*t on a fixed
-# t in [0,1], Gauss-Legendre nodes strictly interior).
-#
-# I(theta) = P + sum_m s_m * Q_m, P/Q_m bounded (ordinary moving-boundary
-# lemma scope) -- not needed by test_V13 itself (which studies s directly)
-# but returned in info for completeness/parity with v9_escaping_flux.
+# Generalizes v9_escaping_flux's scalar feedback to k fluorescent species
+# sharing one TIR-bounded interface: same lambda_star(A,B), same
+# w-substitution, same R(lam). With K_x = sum_j qy_j * e_j (x) a_j, each
+# species' consumed flux s_j = qy_j * integral_Omega a_j L dlam obeys, via
+# the same (1-R)*G0 = 1 identity,
+#     (I - B) s = b
+#     b_j    = qy_j * integral a_j L_e / (1-R) dlam
+#     B[j,m] = qy_j * integral a_j e_m / (1-R) dlam
+# B[j,m] is nonzero only when species j's absorption overlaps species m's
+# emission (photons from m reabsorbed by j). b and B carry the same
+# 1/sqrt(lam - lambda_star) singularity as v9_escaping_flux, removed the same
+# way. I(theta) = P + sum_m s_m * Q_m is returned for parity, though the test
+# works with s directly.
 
 def v9_escaping_flux_multi(
     A:             torch.Tensor,
@@ -532,9 +503,8 @@ def v9_escaping_flux_multi(
 
 
 # ---------------------------------------------------------------------------
-# Levenberg-Marquardt recovery (V5, V6) — nonlinear least-squares over a
-# differentiable forward model, using the same Jacobian machinery the
-# G/T-series conditioning tests already build.
+# Levenberg-Marquardt recovery: nonlinear least-squares over a differentiable
+# forward model.
 # ---------------------------------------------------------------------------
 
 def levenberg_marquardt(
@@ -546,7 +516,7 @@ def levenberg_marquardt(
 ) -> tuple[torch.Tensor, float, int]:
     """Marquardt-damped Gauss-Newton: minimize ||residual_fn(theta)||^2.
 
-    Marquardt scaling (J^T J + lam * diag(J^T J)) delta = -J^T r — the
+    Marquardt scaling (J^T J + lam * diag(J^T J)) delta = -J^T r, the
     diag(J^T J) damping (rather than plain lam*I) keeps steps well-scaled
     when parameters span very different physical units (e.g. d ~ 1e2 nm vs
     B ~ 1e3 nm^2), without any manual per-parameter normalization.

@@ -107,7 +107,7 @@ _D65_SPD = [
 
 
 def cie1931_cmf(device=None) -> tuple:
-    """CIE 1931 2° CMF. Returns (lam_nm, cmf) — lam_nm: (95,), cmf: (95, 3) [x̄, ȳ, z̄]."""
+    """CIE 1931 2° CMF. Returns (lam_nm, cmf), lam_nm: (95,), cmf: (95, 3) [x̄, ȳ, z̄]."""
     lam = torch.tensor(_LAM_NM, dtype=torch.float64, device=device)
     cmf = torch.stack([
         torch.tensor(_CMF_X, dtype=torch.float64, device=device),
@@ -118,7 +118,7 @@ def cie1931_cmf(device=None) -> tuple:
 
 
 def d65_spd(device=None) -> tuple:
-    """CIE D65 illuminant SPD. Returns (lam_nm, spd) — lam_nm: (95,), spd: (95,) normalized to 100 at 560 nm."""
+    """CIE D65 illuminant SPD. Returns (lam_nm, spd), lam_nm: (95,), spd: (95,) normalized to 100 at 560 nm."""
     lam = torch.tensor(_LAM_NM, dtype=torch.float64, device=device)
     spd = torch.tensor(_D65_SPD, dtype=torch.float64, device=device)
     return lam, spd

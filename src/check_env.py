@@ -6,7 +6,7 @@ import matplotlib
 
 def checkEnv():
     print("=" * 63)
-    print(" Differentiable Bispectral Rendering — Environment Check")
+    print(" Differentiable Bispectral Rendering - Environment Check")
     print("=" * 63)
 
     print(f"Python Version : {sys.version.split()[0]}")
@@ -19,7 +19,7 @@ def checkEnv():
 
     print("\n[Dtype]")
     print(f"Default dtype  : {torch.get_default_dtype()}")
-    assert torch.get_default_dtype() == torch.float64, "float64 not set — call torch.set_default_dtype(torch.float64) at entry point"
+    assert torch.get_default_dtype() == torch.float64, "float64 not set: call torch.set_default_dtype(torch.float64) at the entry point"
     print("float64        : OK")
 
     print("\n[Hardware]")
