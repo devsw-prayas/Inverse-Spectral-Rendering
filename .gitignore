@@ -31,3 +31,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Auto-regenerated test comparison tables (rebuilt on every test run)
+results/structural_table.csv
+results/validation_table.csv
+results/validation_table.tex
