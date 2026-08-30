@@ -104,6 +104,11 @@ wrong right at that angle; a number of tests exist just to pin that edge down.
   square-root change of variable that pins the critical angle in place
   removes the blow-up entirely; checked symbolically and for both
   polarizations across the dispersion parameters.
+- **A15** the measured result is infinitely differentiable in every
+  parameter (analytic in all but the two dispersion coefficients), even
+  where the underlying reflectance and internal field are not; the
+  square-root kink in those cancels out of the integral that forms the
+  measurement.
 
 **T-series, small numerical checks** (one component at a time, no full
 scene; `T0` is the build gate):
