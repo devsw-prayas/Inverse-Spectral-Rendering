@@ -24,6 +24,26 @@ This module verifies all three pieces against the three-way oracle style:
   BC9  k-species necessity: rho(Gamma) < 1 IFF rho(T_k) < 1      (torch f64)
   BC10 decoupling: species pulled apart -> det(I_k - Gamma) = prod(1 - Gamma_ss)
 
+F4 remainder (2026-08-30):
+
+  BC11 reabsorption loop A->B->A stays rank-k; Woodbury solve is EXACT vs a
+       brute-force dense solve of (I - T_k) L = L_e on the propagating set
+  BC12 the 2-cycle is the Gamma_AB Gamma_BA term of (I_k - Gamma)^-1: it sits
+       in (Gamma^2)_AA and in det(I_2 - Gamma)
+  BC13 cycle-sourced ill-posedness: a PURE off-diagonal cycle (Gamma_AA =
+       Gamma_BB = 0) has rho(Gamma) = sqrt(Gamma_AB Gamma_BA), which crosses 1
+       and drives rho(T_k) past 1 (biconditional, BC9, sourced by the loop);
+       breaking one leg kills it
+  BC14 Fredholm "only if" shadow: sup R -> 1 (K_x = 0) makes a CLUSTER of
+       (I - T) singular values collapse (count ~ f*N, grows with the grid) --
+       1 entering the essential spectrum; a fluorescence-tuned B_fl = 1 with
+       R bounded away from 1 collapses EXACTLY ONE (discrete eigenvalue, still
+       Fredholm index 0)
+  BC15 Vitali "only if" by counterexample: for a moving-boundary integral with
+       a non-L1 endpoint singularity, the substituted (uniformly integrable)
+       fixed-domain form has autograd == FD, while the raw naive interior-only
+       term diverges -- AD = I' exactly where uniform integrability holds
+
 Run:
     "C:\\Users\\Dell\\anaconda3\\envs\\Spectral\\python.exe" -m tests.test_biconditional
 """
@@ -578,6 +598,310 @@ def test_BC10() -> list[StructResult]:
     ]
 
 
+# ===========================================================================
+# F4 remainder: reabsorption loop (BC11-BC13), Fredholm "only if" (BC14),
+# Vitali "only if" (BC15).
+# ===========================================================================
+
+def _cycle_scene_k2(N=140, seed=40, r_hi=0.70, qy=(0.9, 0.9),
+                    a_ctr=(0.35, 0.55), e_ctr=(0.55, 0.35), width=0.05,
+                    L0=1.0):
+    """k=2 scene with a genuine A->B->A coupling cycle.
+
+    a_A overlaps e_B  (species A reabsorbs B's emission -> Gamma_AB != 0) and
+    a_B overlaps e_A  (species B reabsorbs A's emission -> Gamma_BA != 0).
+    All R < r_hi < 1, so every wavelength is propagating and (1 - R) G0 = 1
+    holds exactly: the rank-k Woodbury reduction is then EXACT, not an
+    approximation. (An anti-Stokes leg is unphysical for real dyes; this is an
+    operator-algebra test, profiles placed to realize the 2-cycle.)
+    """
+    g = _rng(seed)
+    R = torch.sort(torch.rand(N, generator=g) * r_hi + 0.02).values
+    w = torch.rand(N, generator=g) * 0.5 + 0.5
+    idx = torch.linspace(0.0, 1.0, N)
+    A = torch.stack([torch.exp(-0.5 * ((idx - c) / width) ** 2) for c in a_ctr])
+    E = torch.stack([torch.exp(-0.5 * ((idx - c) / width) ** 2) for c in e_ctr])
+    L_e = torch.full((N,), float(L0))
+    return R, A, E, w, torch.tensor(qy, dtype=torch.float64), L_e
+
+
+def _gamma_b_cycle(R, A, E, w, qy, L_e=None):
+    D = w / (1.0 - R)
+    Gam = qy[:, None] * torch.einsum("j,sj,mj->sm", D, A, E)
+    if L_e is None:
+        return Gam, None
+    b = qy * torch.einsum("j,sj,j->s", D, A, L_e)
+    return Gam, b
+
+
+def _rescale_qy_to_rho(R, A, E, w, qy, target):
+    """Rescale qy so spectral_radius(Gamma) == target (Gamma is linear in qy
+    only when qy is uniform, which it is in these cycle scenes)."""
+    Gam, _ = _gamma_b_cycle(R, A, E, w, qy)
+    return qy * (target / spectral_radius(Gam))
+
+
+def _build_Tk_cycle(R, A, E, w, qy):
+    return torch.diag(R) + torch.einsum("si,sj->ij", E, (qy[:, None] * w * A))
+
+
+def test_BC11() -> list[StructResult]:
+    R, A, E, w, qy0, L_e = _cycle_scene_k2()
+    qy = _rescale_qy_to_rho(R, A, E, w, qy0, 0.7)   # well-posed cycle
+    k, N = A.shape
+    Gam, b = _gamma_b_cycle(R, A, E, w, qy, L_e)
+    Tk = _build_Tk_cycle(R, A, E, w, qy)
+
+    # rank of K_x = T_k - diag(R): must be exactly k despite the cycle
+    kx_rank = torch.linalg.matrix_rank(Tk - torch.diag(R), tol=1e-9).item()
+
+    # Woodbury reduced solve vs brute-force dense solve on the full grid
+    s_wood = torch.linalg.solve(torch.eye(k) - Gam, b)
+    L_brute = torch.linalg.solve(torch.eye(N) - Tk, L_e)
+    s_brute = qy * torch.einsum("sj,j,j->s", A, w, L_brute)
+    rel = (s_wood - s_brute).abs().max().item() / s_brute.abs().max().item()
+
+    cycle_live = min(Gam[0, 1].item(), Gam[1, 0].item()) > 1e-6   # both legs
+
+    return [
+        StructResult(
+            "BC11", "reabsorption loop: rank(K_x) == k exactly (no new rank)",
+            float(kx_rank), float(k), abs(kx_rank - k), 0.0, kx_rank == k,
+            "every re-emission is into a FIXED profile e_j, so K_x stays "
+            "sum_j e_j (x) (qy_j a_j) whatever the coupling-graph topology",
+        ),
+        StructResult(
+            "BC11", "A->B->A cycle is live (both Gamma_AB and Gamma_BA nonzero)",
+            min(Gam[0, 1].item(), Gam[1, 0].item()), None, None, None, cycle_live,
+            f"Gamma = {[[round(x, 4) for x in row] for row in Gam.tolist()]}",
+        ),
+        StructResult(
+            "BC11", "Woodbury s = (I_k - Gamma)^-1 b matches brute-force dense solve",
+            rel, 0.0, rel, 1e-12, rel < 1e-12,
+            "(1 - R) G0 = 1 on the all-propagating grid makes the reduction exact",
+        ),
+    ]
+
+
+def test_BC12() -> list[StructResult]:
+    R, A, E, w, qy0, L_e = _cycle_scene_k2()
+    qy = _rescale_qy_to_rho(R, A, E, w, qy0, 0.7)
+    Gam, _ = _gamma_b_cycle(R, A, E, w, qy)
+    gAA, gAB = Gam[0, 0].item(), Gam[0, 1].item()
+    gBA, gBB = Gam[1, 0].item(), Gam[1, 1].item()
+
+    # the 2-cycle term lives in (Gamma^2)_AA
+    g2_AA = (Gam @ Gam)[0, 0].item()
+    pred = gAA ** 2 + gAB * gBA
+    rel_g2 = abs(g2_AA - pred) / abs(pred)
+
+    # ... and in det(I_2 - Gamma)
+    det_full = torch.linalg.det(torch.eye(2) - Gam).item()
+    det_nocycle = (1.0 - gAA) * (1.0 - gBB)          # drop Gamma_AB Gamma_BA
+    cycle_contrib = det_full - det_nocycle
+    rel_det = abs(cycle_contrib - (-gAB * gBA)) / abs(gAB * gBA)
+
+    # Neumann sum of Gamma^n reproduces (I_2 - Gamma)^-1 (rho(Gamma) < 1)
+    rho_g = spectral_radius(Gam)
+    P = torch.eye(2)
+    S = torch.zeros(2, 2)
+    for _ in range(400):
+        S = S + P
+        P = P @ Gam
+    rel_neu = (S - torch.linalg.inv(torch.eye(2) - Gam)).abs().max().item()
+
+    return [
+        StructResult(
+            "BC12", "(Gamma^2)_AA == Gamma_AA^2 + Gamma_AB Gamma_BA (the 2-cycle path)",
+            rel_g2, 0.0, rel_g2, 1e-12, rel_g2 < 1e-12,
+            f"A absorbs B absorbs A: Gamma_AB Gamma_BA = {gAB * gBA:.4e}",
+        ),
+        StructResult(
+            "BC12", "det(I_2 - Gamma) cycle contribution == -Gamma_AB Gamma_BA",
+            rel_det, 0.0, rel_det, 1e-10, rel_det < 1e-10,
+            f"det with cycle {det_full:.5f} vs without {det_nocycle:.5f}",
+        ),
+        StructResult(
+            "BC12", "Neumann sum_n Gamma^n == (I_2 - Gamma)^-1 (rho(Gamma) < 1)",
+            rel_neu, 0.0, rel_neu, 1e-10, rel_neu < 1e-10,
+            f"rho(Gamma) = {rho_g:.4f}; the loop is all walks through the 2-cycle",
+        ),
+    ]
+
+
+def test_BC13() -> list[StructResult]:
+    out = []
+    # PURE off-diagonal cycle: species do not self-absorb (a_A misses e_A,
+    # a_B misses e_B), so Gamma_AA = Gamma_BB ~ 0 and rho(Gamma) is entirely
+    # the cycle:  eig([[0, g_AB], [g_BA, 0]]) = +- sqrt(g_AB g_BA).
+    base = dict(N=160, seed=41, r_hi=0.65, width=0.04,
+                a_ctr=(0.30, 0.62), e_ctr=(0.62, 0.30))
+
+    def scene(qy_scale):
+        return _cycle_scene_k2(qy=(0.95 * qy_scale, 0.95 * qy_scale), **base)
+
+    # calibrate qy_scale so rho(Gamma) hits a target (rho ~ qy_scale here)
+    R, A, E, w, qy, L_e = scene(1.0)
+    Gam1, _ = _gamma_b_cycle(R, A, E, w, qy)
+    rho1 = spectral_radius(Gam1)
+    diag_frac = torch.diagonal(Gam1).abs().max().item() / rho1
+    out.append(StructResult(
+        "BC13", "pure cycle: Gamma_AA, Gamma_BB negligible vs rho(Gamma)",
+        diag_frac, 0.0, diag_frac, 5e-3, diag_frac < 5e-3,
+        f"diag(Gamma) = {torch.diagonal(Gam1).tolist()}, rho(Gamma) = {rho1:.4f}",
+    ))
+    gAB, gBA = Gam1[0, 1].item(), Gam1[1, 0].item()
+    rel_sqrt = abs(rho1 - (gAB * gBA) ** 0.5) / rho1
+    out.append(StructResult(
+        "BC13", "pure cycle: rho(Gamma) == sqrt(Gamma_AB Gamma_BA)",
+        rel_sqrt, 0.0, rel_sqrt, 1e-6, rel_sqrt < 1e-6,
+        f"sqrt({gAB:.4e} * {gBA:.4e}) = {(gAB * gBA) ** 0.5:.4f}",
+    ))
+
+    for tag, target in (("well posed", 0.6), ("ill posed", 1.5)):
+        sc = target / rho1
+        R, A, E, w, qy, L_e = scene(sc)
+        Gam, b = _gamma_b_cycle(R, A, E, w, qy, L_e)
+        Tk = _build_Tk_cycle(R, A, E, w, qy)
+        rho_g = spectral_radius(Gam)
+        rho_t = spectral_radius(Tk)
+        both = (rho_g < 1.0) == (rho_t < 1.0)
+        det_perron = abs(torch.linalg.det(
+            torch.eye(2) + _cycle_M_of_z(rho_t, R, A, E, w, qy)).item())
+        out.append(StructResult(
+            "BC13", f"{tag}: sign(rho(Gamma) - 1) == sign(rho(T_k) - 1), cycle-sourced",
+            0.0 if both else 1.0, 0.0, 0.0 if both else 1.0, 0.0, both,
+            f"rho(Gamma) = {rho_g:.4f}, rho(T_k) = {rho_t:.4f}, sup R = "
+            f"{R.max().item():.3f} -- ill-posedness here comes ONLY from the loop",
+        ))
+        out.append(StructResult(
+            "BC13", f"{tag}: |det(I_2 + M(z))| = 0 at z = rho(T_k)",
+            det_perron, 0.0, det_perron, 1e-7, det_perron < 1e-7,
+            f"z = {rho_t:.6f}",
+        ))
+
+    # break one leg: move a_B off e_A -> Gamma_BA ~ 0 -> rho(Gamma) collapses
+    broke = dict(base)
+    broke["a_ctr"] = (0.30, 0.88)                 # a_B now far from e_A @ 0.62
+    R, A, E, w, qy, L_e = _cycle_scene_k2(qy=(0.95 * 1.5 / rho1, 0.95 * 1.5 / rho1),
+                                          **broke)
+    Gam, _ = _gamma_b_cycle(R, A, E, w, qy)
+    rho_broken = spectral_radius(Gam)
+    still_has_AB = Gam[0, 1].item() > 1e-3
+    out.append(StructResult(
+        "BC13", "break one leg (a_B off e_A): rho(Gamma) collapses below 1",
+        rho_broken, None, None, None, rho_broken < 1.0 and still_has_AB,
+        f"rho(Gamma) {rho1 * (1.5 / rho1):.2f} -> {rho_broken:.4f} at the SAME qy "
+        f"scaling; Gamma_AB still {Gam[0, 1].item():.3e} -- it is the CYCLE, not "
+        "one leg, that breaks well-posedness",
+    ))
+    return out
+
+
+def _cycle_M_of_z(z, R, A, E, w, qy):
+    # M(z)_{sm} for the qy-folded k-species T_k = diag(R) + sum_s e_s (qy_s w a_s)^T
+    D = (qy[:, None] * w) / (R - z)
+    return torch.einsum("sj,mj->sm", D * A, E)
+
+
+def test_BC14() -> list[StructResult]:
+    out = []
+    tol = 5e-2
+
+    # Case A -- 1 entering the ESSENTIAL spectrum: K_x = 0, sup R -> 1.
+    # I - T = diag(1 - R); a whole BAND of eigenvalues collapses toward 0, and
+    # the near-null count scales ~linearly with N (a continuum, not a point).
+    delta = 2e-2
+    counts_A = []
+    for N in (100, 200, 400):
+        R = torch.linspace(0.10, 1.0 - delta, N)
+        sv = torch.linalg.svdvals(torch.eye(N) - torch.diag(R))
+        counts_A.append(int((sv < 5.0 * delta).sum().item()))
+    ratios_A = [counts_A[i + 1] / counts_A[i] for i in range(len(counts_A) - 1)]
+    scales_with_N = all(1.7 < r < 2.3 for r in ratios_A)
+    out.append(StructResult(
+        "BC14", "essential-spectrum shadow: near-null count scales ~linearly with N",
+        sum(ratios_A) / len(ratios_A), 2.0,
+        abs(sum(ratios_A) / len(ratios_A) - 2.0) / 2.0, 0.15, scales_with_N,
+        f"count at N=100,200,400 = {counts_A} (per-doubling ratios "
+        f"{[f'{r:.2f}' for r in ratios_A]} ~ 2) -- a CONTINUUM of near-eigenvalues "
+        "at 1 (I - T not Fredholm)",
+    ))
+
+    # Case B -- 1 as a DISCRETE eigenvalue: R bounded away from 1, fluorescence
+    # tuned to B_fl = 1. Exactly one singular value collapses, at every N.
+    counts_B = []
+    for i, N in enumerate((100, 200, 400)):
+        R, a, e, w = _scene_with_Bfl(N, 50 + i, sup_R=0.85, target_Bfl=1.0)
+        sv = torch.linalg.svdvals(torch.eye(N) - build_T(R, a, e, w))
+        counts_B.append(int((sv < 1e-6).sum().item()))
+    out.append(StructResult(
+        "BC14", "discrete eigenvalue at 1: EXACTLY ONE near-null s.v. at every N",
+        float(max(counts_B)), 1.0, float(max(counts_B) - 1), 0.0,
+        all(c == 1 for c in counts_B),
+        f"count at N=100,200,400 = {counts_B} -- 1-dim kernel, I - T still "
+        "Fredholm index 0 (contrast Case A)",
+    ))
+    return out
+
+
+def test_BC15() -> list[StructResult]:
+    from src.gradient import gauss_legendre_01
+
+    g_fn = lambda x: 1.0 + x ** 2 + 0.3 * x ** 3          # smooth, nontrivial
+    theta = 0.30
+
+    # Moving-boundary integral  I(theta) = int_theta^1 g(x) / sqrt(x - theta) dx.
+    # Substitute w = sqrt(x - theta):  I(theta) = 2 int_0^sqrt(1-theta) g(theta + w^2) dw.
+    nodes, wts = gauss_legendre_01(96)
+
+    def I_sub(th):
+        W = torch.sqrt(1.0 - th)
+        wq = W * nodes
+        return 2.0 * (wts * W * g_fn(th + wq ** 2)).sum()
+
+    th_t = torch.tensor(theta, requires_grad=True)
+    I_sub(th_t).backward()
+    ad_sub = th_t.grad.item()
+
+    h = 1e-6
+    with torch.no_grad():
+        fd = ((I_sub(torch.tensor(theta + h)) - I_sub(torch.tensor(theta - h)))
+              / (2.0 * h)).item()
+    rel_sub = abs(ad_sub - fd) / abs(fd)
+
+    # Raw naive moving-domain reverse-mode = interior term only:
+    #   int_theta^1 d/dtheta [ g(x)/sqrt(x - theta) ] dx
+    #     = int_theta^1 g(x) * 0.5 (x - theta)^{-3/2} dx      -- NOT in L^1.
+    def naive_interior(eps):
+        xs = torch.linspace(theta + eps, 1.0, 200000)
+        integ = g_fn(xs) * 0.5 * (xs - theta) ** (-1.5)
+        return torch.trapz(integ, xs).item()
+
+    eps_seq = (1e-2, 1e-3, 1e-4, 1e-5)
+    naive_seq = [naive_interior(e) for e in eps_seq]
+    naive_ratios = [naive_seq[i + 1] / naive_seq[i] for i in range(len(naive_seq) - 1)]
+    naive_diverges = all(r > 2.0 for r in naive_ratios)
+
+    return [
+        StructResult(
+            "BC15", "uniformly integrable (substituted): autograd == true I'(theta)",
+            rel_sub, 0.0, rel_sub, 1e-7, rel_sub < 1e-7,
+            f"AD {ad_sub:.8f} vs FD {fd:.8f} -- differentiation under the "
+            "integral is valid, DCT holds",
+        ),
+        StructResult(
+            "BC15", "NOT uniformly integrable (raw): naive interior term diverges",
+            naive_ratios[-1] if naive_ratios else 0.0, None, None, None,
+            naive_diverges,
+            f"int_{{theta+eps}}^1 dh/dtheta dx at eps=1e-2..1e-5: "
+            f"{[f'{x:.1f}' for x in naive_seq]} (ratios {[f'{r:.2f}' for r in naive_ratios]}"
+            f", ~sqrt(10)) -- dh/dtheta not in L^1, so naive moving-domain "
+            "reverse-mode != I'(theta): the Vitali 'only if' by counterexample",
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -585,6 +909,7 @@ def test_BC10() -> list[StructResult]:
 ALL = [
     test_BC1_BC2, test_BC3, test_BC4, test_BC5,
     test_BC6, test_BC7, test_BC8, test_BC9, test_BC10,
+    test_BC11, test_BC12, test_BC13, test_BC14, test_BC15,
 ]
 
 
