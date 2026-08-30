@@ -1157,12 +1157,290 @@ def test_A13() -> StructResult:
 
 
 # ---------------------------------------------------------------------------
+# A14: angular t = sqrt(1 - s) substitution -- theta-uniform DCT domination
+#      at the moving critical angle.
+#
+# Prewriteup Section 7 / D5 / F4: Section 3's moving-domain gradient needs the
+# reparameterized integrand's theta-derivative to have a single L1 dominator
+# of  sup_{theta in U} |d h/d theta|  over a parameter neighborhood U. As
+# theta = (A, B) ranges over U the critical incidence angle theta_c(A, B)
+# moves, sweeping an interval of the sampling variable theta_i; on that
+# interval the pointwise sup places the O(u^{-1/2}) singularity (u = 1 - s,
+# s = (n_i/n_t) sin theta_i) at every point, so the fixed-locus bound
+# (d h/d theta(.; theta_0) in L1 for ONE theta_0, the running_notes check)
+# does not transfer -- sup_U is +inf on a positive-measure set.
+#
+# Repair (angular twin of Section 8 / D7's w-substitution): change variable
+#   t = sqrt(1 - s),   s = (n_i/n_t) sin theta_i,
+# which pins theta_c(theta) to t = 0 for every theta in U. Under this map
+#   v = cos theta_t = sqrt(1 - s^2) = sqrt(1 - (1 - t^2)^2) = t sqrt(2 - t^2)
+# is theta-INDEPENDENT (the entire 1/v = O(u^{-1/2}) blow-up channel,
+# d v/d theta at fixed theta_i, vanishes identically), and the transformed
+# integrand h~(t; theta) = F(v(t)) * |d theta_i/d t| and its theta-derivative
+# are bounded on t in (0, 1] uniformly over U.
+#
+# Prior status (addendum_fable5_crosscheck Part A.1): confirmed NUMERICALLY on
+# a reduced toy only -- single parameter A, s-pol, n_t = A; dominating const
+# ~1.55; raw FD-step blow-up 137 -> 332 -> 1073 -> 3532 -> 14401. This test
+# promotes it: symbolic (sympy limits + Puiseux) for the branch structure,
+# and numeric for the full Cauchy pair (A, B), n_t = 1 glass->air, s AND p.
+#
+# Physical model (project-consistent, matches V9): light inside dispersive
+# glass hitting glass/air, n_i = A + B/lam^2, n_t = 1, eta = n_i/n_t = n_i,
+# eta > 1 so a per-wavelength critical angle exists (sin theta_c = 1/eta).
+#   s-pol:  F_s(v) = 4 eta c^2 / (eta c + v)^2,   F_s(0) = 4/eta
+#   p-pol:  F_p(v) = 4 eta c^2 / (c + eta v)^2,   F_p(0) = 4 eta
+# with c = cos theta_i. This is a validity lemma (DCT for the certificate's
+# hypothesis H4); no in-repo angular-moving-boundary gradient exists to
+# regularize, so it is test-only, no src/ change.
+# ---------------------------------------------------------------------------
+
+def _A14_h_tilde_torch(t, A, B, lam, n_t, pol):
+    """Transformed integrand h~(t; A, B) built directly from src Fresnel.
+
+    t in (0, 1];  parametrization s = 1 - t^2, sin_i = s * n_t / n_i.
+    """
+    import torch as _t
+    from src.cauchy_ior import cos_theta_t
+
+    n_i = A + B / lam ** 2
+    eta = n_i / n_t
+    s = 1.0 - t ** 2
+    sin_i = s * (n_t / n_i)
+    cos_i = _t.sqrt(1.0 - sin_i ** 2)
+    v = cos_theta_t(cos_i, n_i, n_t)                 # = t*sqrt(2 - t^2), theta-free
+    # closed-form throughput F(v) = T(v) * c / v  (eta^2 already cancelled)
+    if pol == "s":
+        F = 4.0 * eta * cos_i ** 2 / (eta * cos_i + v) ** 2
+    else:
+        F = 4.0 * eta * cos_i ** 2 / (cos_i + eta * v) ** 2
+    jac = 2.0 * t / (eta * cos_i)                    # |d theta_i / d t|
+    return F * jac
+
+
+def _A14_fd_sup(fn, params, idx, hstep, t_grid):
+    """sup_t |central-FD d fn/d params[idx]| over t_grid."""
+    p_plus = list(params); p_plus[idx] = p_plus[idx] + hstep
+    p_minus = list(params); p_minus[idx] = p_minus[idx] - hstep
+    d = (fn(t_grid, *p_plus) - fn(t_grid, *p_minus)) / (2.0 * hstep)
+    return d.abs().max().item()
+
+
+def test_A14() -> list[StructResult]:
+    import sympy as sp
+    import torch
+
+    out: list[StructResult] = []
+
+    # =====================================================================
+    # Part 1 -- SYMBOLIC: the branch structure the substitution removes
+    # =====================================================================
+    t, A, B, u = sp.symbols("t A B u", positive=True)
+    lam0 = sp.Integer(550)
+    n_t = sp.Integer(1)
+
+    # ---- 1a. RAW integrand: d v/dA at fixed physical incidence diverges. ----
+    # v = sqrt(1 - s^2), s = eta * sin_i, eta = A + B/lam^2 (n_t = 1).
+    # Fix sin_i = sig; approach critical by A -> A_crit where eta*sig = 1.
+    sig = sp.Rational(3, 5)                       # sin theta_i = 0.6
+    B0 = sp.Integer(0)                            # toy slice: pure A (n_i = A)
+    eta_raw = (A + B0 / lam0 ** 2) / n_t
+    s_raw = eta_raw * sig
+    v_raw = sp.sqrt(1 - s_raw ** 2)
+    A_crit = sp.Rational(1, 1) / sig              # eta = 1/sig => s = 1
+    dv_dA_raw = sp.diff(v_raw, A)
+    lim_raw = sp.limit(dv_dA_raw, A, A_crit, dir="-")
+    raw_diverges = lim_raw in (sp.oo, -sp.oo, sp.zoo)
+    out.append(StructResult(
+        "A14", "symbolic: RAW d v/dA -> infinity at the critical angle (fixed theta_i)",
+        1.0 if raw_diverges else 0.0, 1.0, 0.0 if raw_diverges else 1.0, 0.0,
+        raw_diverges,
+        f"limit_{{A -> 1/sin_i}} d/dA sqrt(1 - (eta sin_i)^2) = {lim_raw} "
+        "-- the O(u^-1/2) channel that breaks sup_U domination",
+    ))
+
+    # ---- 1b. RAW branch order: dv/du ~ u^{-1/2}, leading exponent -1/2. ----
+    # s = 1 - u  =>  v = sqrt(1 - (1-u)^2) = sqrt(2u - u^2).
+    v_of_u = sp.sqrt(2 * u - u ** 2)
+    ser = sp.series(sp.diff(v_of_u, u), u, 0, 2).removeO()
+    terms = sp.Add.make_args(sp.expand(ser))
+    lead_coeff, lead_exp = sorted(
+        (term.as_coeff_exponent(u) for term in terms), key=lambda ce: ce[1])[0]
+    exp_is_minus_half = sp.simplify(lead_exp - sp.Rational(-1, 2)) == 0
+    out.append(StructResult(
+        "A14", "symbolic: RAW d v/du Puiseux leading exponent == -1/2 (branch point)",
+        float(lead_exp), -0.5, abs(float(lead_exp) + 0.5), 0.0, exp_is_minus_half,
+        f"d/du sqrt(2u - u^2) ~ {lead_coeff}*u^({lead_exp})",
+    ))
+
+    # ---- 1c. SUBSTITUTED: v(t) is theta-free, so d v/d theta == 0. ----
+    v_sub = t * sp.sqrt(2 - t ** 2)               # sqrt(1 - (1 - t^2)^2)
+    dv_sub_dA = sp.simplify(sp.diff(v_sub, A))
+    dv_sub_dB = sp.simplify(sp.diff(v_sub, B))
+    v_channel_killed = (dv_sub_dA == 0) and (dv_sub_dB == 0)
+    out.append(StructResult(
+        "A14", "symbolic: SUBSTITUTED v(t) is theta-independent (singular channel removed)",
+        0.0 if v_channel_killed else 1.0, 0.0, 0.0 if v_channel_killed else 1.0, 0.0,
+        v_channel_killed,
+        f"v(t) = t sqrt(2 - t^2); d v/dA = {dv_sub_dA}, d v/dB = {dv_sub_dB}",
+    ))
+
+    # ---- 1d. SUBSTITUTED h~ and its A,B derivatives are BOUNDED at t -> 0. ----
+    #        Full Cauchy pair, n_t = 1.  h~(t; A, B) = F(v(t)) * |d th_i/dt|.
+    n_i_s = A + B / lam0 ** 2
+    eta_s = n_i_s / n_t
+    s_s = 1 - t ** 2
+    sin_i_s = s_s * n_t / n_i_s
+    c_s = sp.sqrt(1 - sin_i_s ** 2)
+    jac_s = 2 * t / (eta_s * c_s)
+
+    def _bounded_limit(expr, var):
+        L = sp.limit(expr, t, 0, dir="+")
+        return L.is_finite is True, L
+
+    checks_1d = []
+    for pol, Fexpr in (
+        ("s", 4 * eta_s * c_s ** 2 / (eta_s * c_s + v_sub) ** 2),
+        ("p", 4 * eta_s * c_s ** 2 / (c_s + eta_s * v_sub) ** 2),
+    ):
+        h_tilde = Fexpr * jac_s
+        for pname, pvar in (("A", A), ("B", B)):
+            fin, L = _bounded_limit(sp.diff(h_tilde, pvar), pvar)
+            checks_1d.append((pol, pname, fin, L))
+
+    all_bounded_1d = all(fin for _, _, fin, _ in checks_1d)
+    detail = "; ".join(f"d h~_{p}/d{q} -> {'finite' if f else L}"
+                       for p, q, f, L in checks_1d)
+    out.append(StructResult(
+        "A14", "symbolic: SUBSTITUTED d h~/dA and d h~/dB bounded as t -> 0 (s AND p)",
+        0.0 if all_bounded_1d else 1.0, 0.0, 0.0 if all_bounded_1d else 1.0, 0.0,
+        all_bounded_1d, detail,
+    ))
+
+    # ---- 1e. SUBSTITUTED d h~/dA Puiseux: no negative, no half-integer powers. ----
+    h_tilde_s = (4 * eta_s * c_s ** 2 / (eta_s * c_s + v_sub) ** 2) * jac_s
+    ser_sub = sp.series(sp.diff(h_tilde_s, A), t, 0, 3).removeO()
+    sub_terms = sp.Add.make_args(sp.expand(sp.together(ser_sub).rewrite(sp.Pow)))
+    sub_exps = []
+    for term in sub_terms:
+        _, ex = term.as_coeff_exponent(t)
+        sub_exps.append(ex)
+    no_negative = all(sp.simplify(ex) >= 0 for ex in sub_exps)
+    no_half_integer = all(sp.simplify(2 * ex - sp.floor(2 * ex)) == 0
+                          and sp.simplify(ex - sp.floor(ex)) == 0 for ex in sub_exps)
+    out.append(StructResult(
+        "A14", "symbolic: SUBSTITUTED d h~/dA t-series has only nonneg integer powers",
+        0.0 if (no_negative and no_half_integer) else 1.0, 0.0,
+        0.0 if (no_negative and no_half_integer) else 1.0, 0.0,
+        no_negative and no_half_integer,
+        f"recovered t-exponents = {sub_exps} (contrast: RAW carries t^-1)",
+    ))
+
+    # =====================================================================
+    # Part 2 -- NUMERIC: raw blow-up vs substituted stability, full (A, B)
+    # =====================================================================
+    lam = 550.0
+    n_t_v = 1.0
+    A0, B0v = 1.45, 3.6e4                          # n_i(550) ~ 1.569
+    n_i0 = A0 + B0v / lam ** 2
+    theta_c = torch.asin(torch.tensor(1.0 / n_i0))
+
+    # ---- 2a. RAW: sup over the swept interval [theta_c - d, theta_c) grows
+    #        without bound as d -> 0. This is the actual failure of sup_U
+    #        domination: for any interval touching theta_c the sup is +inf,
+    #        because d h/dA ~ (theta_c - theta_i)^{-1/2} pointwise. FD step is
+    #        held well below d so each sup value itself converges cleanly.
+    def h_raw_s(th_i, A_, B_):
+        n_i = A_ + B_ / lam ** 2
+        eta = n_i / n_t_v
+        sin_i = torch.sin(th_i)
+        c = torch.cos(th_i)
+        v = torch.sqrt((1.0 - (eta * sin_i) ** 2).clamp(min=0.0))
+        return 4.0 * eta * c ** 2 / (eta * c + v) ** 2
+
+    raw_seq, d_seq = [], (1e-2, 1e-3, 1e-4, 1e-5, 1e-6)
+    for d in d_seq:
+        th_grid = theta_c - torch.logspace(0.0, -2.0, 30, base=10.0) * (d * theta_c)
+        raw_seq.append(_A14_fd_sup(h_raw_s, (A0, B0v), 0, d * 1e-3, th_grid))
+    raw_growth = raw_seq[-1] / raw_seq[0]
+    raw_ratios = [raw_seq[i + 1] / raw_seq[i] for i in range(len(raw_seq) - 1)]
+    # each decade of d should multiply the sup by ~sqrt(10) ~ 3.16 (u^{-1/2})
+    raw_monotone_growing = all(r > 2.0 for r in raw_ratios)
+    out.append(StructResult(
+        "A14", "numeric: RAW sup|d h/dA| over [theta_c - d, theta_c) diverges as d -> 0",
+        raw_growth, None, None, None,
+        raw_monotone_growing and raw_growth > 50.0,
+        f"d = 1e-2..1e-6: sup = {[f'{x:.1f}' for x in raw_seq]}; "
+        f"per-decade ratios {[f'{r:.2f}' for r in raw_ratios]} (~sqrt(10), the "
+        f"u^-1/2 rate); x{raw_growth:.0f} total -- no finite dominator",
+    ))
+
+    # ---- 2b. SUBSTITUTED: sup over t in (0, 1], FD step 1e-3 .. 1e-8. ----
+    t_grid = torch.linspace(1e-4, 1.0, 400)
+    for pol in ("s", "p"):
+        fn = lambda tg, A_, B_, _p=pol: _A14_h_tilde_torch(tg, A_, B_, lam, n_t_v, _p)
+        subA = [_A14_fd_sup(fn, (A0, B0v), 0, h, t_grid)
+                for h in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8)]
+        driftA = (max(subA) - min(subA)) / min(subA)
+        out.append(StructResult(
+            "A14", f"numeric: SUBSTITUTED sup_t|d h~/dA| stable across FD steps ({pol}-pol)",
+            driftA, 0.0, driftA, 1e-4, driftA < 1e-4,
+            f"dominating const ~ {sum(subA) / len(subA):.4f} (attained at t=1, "
+            f"normal incidence, where s and p coincide -- the t->0 critical end "
+            f"is now harmless); relative drift {driftA:.1e} over steps 1e-3..1e-8",
+        ))
+    # d/dB (s-pol)
+    fn_s = lambda tg, A_, B_: _A14_h_tilde_torch(tg, A_, B_, lam, n_t_v, "s")
+    subB = [_A14_fd_sup(fn_s, (A0, B0v), 1, h, t_grid)
+            for h in (1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6)]   # B ~ 1e4, larger steps
+    driftB = (max(subB) - min(subB)) / min(subB)
+    out.append(StructResult(
+        "A14", "numeric: SUBSTITUTED sup_t|d h~/dB| stable across FD steps (s-pol)",
+        driftB, 0.0, driftB, 1e-4, driftB < 1e-4,
+        f"dominating const ~ {sum(subB) / len(subB):.6f}; relative drift {driftB:.1e}",
+    ))
+
+    # ---- 2c. theta-uniform: sup over a neighborhood U x t-grid is finite. ----
+    U_A = [1.43, 1.45, 1.47]
+    U_B = [3.4e4, 3.6e4, 3.8e4]
+    sup_over_U = 0.0
+    for a in U_A:
+        for b in U_B:
+            sup_over_U = max(sup_over_U,
+                             _A14_fd_sup(fn_s, (a, b), 0, 1e-6, t_grid))
+    out.append(StructResult(
+        "A14", "numeric: theta-uniform -- sup over neighborhood U x (0,1] is finite",
+        sup_over_U, None, None, None, 0.0 < sup_over_U < 1e3,
+        f"sup_{{(A,B) in U}} sup_t |d h~/dA| = {sup_over_U:.4f} over "
+        f"A in {U_A}, B in {U_B}",
+    ))
+
+    # ---- 2d. src cross-check + Theorem-3 endpoint constants. ----
+    # h~/jac at t -> 0 must give F_s(0) = 4/eta, F_p(0) = 4 eta (D5 / A7).
+    t_small = torch.tensor([1e-6])
+    eta0 = n_i0 / n_t_v
+    for pol, target, name in (("s", 4.0 / eta0, "4/eta"), ("p", 4.0 * eta0, "4 eta")):
+        h_t = _A14_h_tilde_torch(t_small, A0, B0v, lam, n_t_v, pol)
+        c_crit = (1.0 - (1.0 / eta0) ** 2) ** 0.5
+        jac0 = (2.0 * t_small.item()) / (eta0 * c_crit)
+        F0 = (h_t.item() / jac0)
+        rel = abs(F0 - target) / target
+        out.append(StructResult(
+            "A14", f"numeric: SUBSTITUTED F_{pol}(v->0) = {name} (Theorem 3 / D5 constant)",
+            F0, target, rel, 1e-5, rel < 1e-5,
+            f"h~/jac at t=1e-6 -> {F0:.6f} vs {target:.6f}",
+        ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
 ALL = [
     test_A1, test_A2, test_A3, test_A4, test_A5, test_A6, test_A7,
-    test_A8, test_A9, test_A10, test_A11, test_A12, test_A13,
+    test_A8, test_A9, test_A10, test_A11, test_A12, test_A13, test_A14,
 ]
 
 

@@ -99,6 +99,11 @@ wrong right at that angle; a number of tests exist just to pin that edge down.
 - **A13** the sampling-probability terms in a Monte Carlo gradient cancel
   under the standard estimator; not relevant to this repo yet (no random
   sampling), noted as a requirement for the future C++ tracer.
+- **A14** at the moving TIR angle, the raw parameter-derivative of the
+  integrand blows up with no common bound as the angle is approached, but a
+  square-root change of variable that pins the critical angle in place
+  removes the blow-up entirely; checked symbolically and for both
+  polarizations across the dispersion parameters.
 
 **T-series, small numerical checks** (one component at a time, no full
 scene; `T0` is the build gate):
