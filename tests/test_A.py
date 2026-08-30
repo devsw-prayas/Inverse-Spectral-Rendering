@@ -22,8 +22,8 @@ A8   Brewster vs v=0              -- T_p(theta_Brewster)=1 is distinct from v=0 
 A9   a_bar -> 0 as sigma_f -> 0   -- no spurious finite floor in the absorption integral
 A10  lambda*(A,B) derivatives     -- kappa-A -> 0: dlambda*/dA and dlambda*/dB diverge at same rate
 A11  lambda_ex,j invariance       -- symbolic k species: d/dlambda_ex,j of sum is zero
-A12  H_wp necessary?              -- open: construct/rule out counterexample where H_wp fails but rho<1
-A13  Discrete event score fn      -- open: does event-type selection probability depend on theta?
+A12  H_wp necessary?              -- resolved: sufficient not necessary; counterexample + points to test_biconditional
+A13  Discrete event score fn      -- open (Phase 2): no stochastic event sampling in the deterministic oracle to test
 A14  angular t=sqrt(1-s) subst.   -- theta-uniform DCT domination at the moving critical angle
 A15  C-infinity of the solve      -- observable I(theta) smooth to all orders; field R,L not (across M_crit)
 """
@@ -1138,24 +1138,91 @@ def test_A11() -> list[StructResult]:
 
 
 # ---------------------------------------------------------------------------
-# A12: H_wp necessary? (OPEN THEORY QUESTION)
-# Task: construct or rule out a counterexample where H_wp fails but rho(T)<1.
-#       Would mean H_wp is overly conservative.
+# A12: H_wp necessary?  -- RESOLVED (2026-07-08 addendum): SUFFICIENT, NOT
+# NECESSARY. H_wp bounds sup R + ||e||_w ||a||_w <= 1 - eps, but for
+# T = c I + e (x) (w*a) the rank-1-update eigenvalues are c (mult n-1) and
+# c + <a,e>_w -- so rho(T) tracks the ACTUAL inner product <a,e>_w, not its
+# Cauchy-Schwarz upper bound ||a||_w ||e||_w. Whenever e, a are not parallel
+# (any Stokes shift) the gap <a,e>_w < ||a||_w ||e||_w is strict, so H_wp can
+# read "violated" while rho(T) stays well under 1.
+#
+# The exact necessary-and-sufficient replacement (1 + m(z) = 0 for one
+# species, det(I_k + M(z)) = 0 for k) is verified in tests/test_biconditional.py
+# (BC1-BC10); BC5 there builds the concrete "sup R < 1 but B_fl > 1 => rho > 1"
+# complement. This check just pins the counterexample the addendum describes.
 # ---------------------------------------------------------------------------
 
-def test_A12() -> StructResult:
-    raise NotImplementedError("A12 -- open theory question, resolve analytically first")
+def test_A12() -> list[StructResult]:
+    import torch
+
+    n = 50
+    c = 0.5                                    # flat reflectance -> M_R = c I
+    lam = torch.linspace(400.0, 700.0, n)
+    w = torch.full((n,), (lam[1] - lam[0]).item())     # uniform quadrature weights
+
+    def _unit(mu, sig):
+        g = torch.exp(-0.5 * ((lam - mu) / sig) ** 2)
+        return g / torch.sqrt((w * g * g).sum())        # ||.||_w = 1
+
+    # a fixed; e slid from full overlap (parallel) to nearly disjoint, so
+    # cos(angle)_w = <a,e>_w sweeps 1 -> ~0.
+    a_hat = _unit(550.0, 40.0)
+    M2 = 1.08                                  # ||a||_w ||e||_w = M2  =>  H_wp
+    a = a_hat * (M2 ** 0.5)                    # bound = c + M2 = 1.58 (fixed)
+
+    hwp_bound = c + M2                         # sup R + ||a||_w ||e||_w
+    max_identity_err = 0.0
+    rho_small = None                           # (inner_product, rho) at low overlap
+    rho_crosses_below_1 = False
+    for shift in [0.0, 20.0, 40.0, 60.0, 90.0, 130.0, 180.0, 240.0]:
+        e_hat = _unit(550.0 + shift, 40.0)
+        e = e_hat * (M2 ** 0.5)
+        inner = M2 * (w * a_hat * e_hat).sum().item()      # <a,e>_w = M2 cos(a,e)
+        T = c * torch.eye(n) + torch.outer(e, w * a)
+        rho = torch.linalg.eigvals(T).abs().max().item()
+        max_identity_err = max(max_identity_err, abs((rho - c) - inner))   # rank-1 id
+        if rho < 1.0:
+            rho_crosses_below_1 = True
+            if rho_small is None:
+                rho_small = (inner, rho)
+
+    return [
+        StructResult(
+            "A12", "H_wp bound (sup R + ||a||_w ||e||_w) stays > 1 for the whole sweep",
+            hwp_bound, None, None, None, hwp_bound > 1.0,
+            f"H_wp reads 'violated' (bound = {hwp_bound:.2f}) at every overlap tested",
+        ),
+        StructResult(
+            "A12", "actual rho(T) drops below 1 as e, a decorrelate -- H_wp NOT necessary",
+            rho_small[1], None, None, None,
+            rho_crosses_below_1 and rho_small[1] < 1.0,
+            f"at <a,e>_w = {rho_small[0]:.3f}: rho(T) = {rho_small[1]:.3f} < 1 while "
+            f"H_wp bound = {hwp_bound:.2f} -- a genuine H_wp-violated but well-posed scene",
+        ),
+        StructResult(
+            "A12", "mechanism: rho(T) - c == <a,e>_w exactly (rank-1-update eigenvalue)",
+            max_identity_err, 0.0, max_identity_err, 1e-12, max_identity_err < 1e-12,
+            "rho tracks the true inner product, not its Cauchy-Schwarz upper bound "
+            "||a||_w ||e||_w; the exact iff form is tests/test_biconditional.py "
+            "BC1-BC10 (BC5 builds the sup R < 1 but B_fl > 1 complement)",
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
-# A13: Discrete event-type score function (OPEN THEORY QUESTION)
-# Task: determine analytically whether the event-type selection probability
-#       (elastic / fluorescent / Raman) depends on theta, and if so whether
-#       a missing REINFORCE-style term exists in the gradient estimator.
+# A13: Discrete event-type score function.  RESOLVED as theory (2026-07-08
+# addendum): not a live gap. The deterministic oracle (forward.py / gradient.py)
+# has no stochastic per-vertex event sampling, so there is nothing here to
+# test. For the C++ tracer: E[1(i) f_i / p_i] = sum f_i makes the sampling
+# pdf's theta-dependence cancel exactly, provided the standard inverse-pdf
+# ratio structure is used -- no REINFORCE term needed. Folded into the C++
+# handoff spec as a correctness requirement; promote to a real check when a
+# stochastic estimator exists (Phase 2).
 # ---------------------------------------------------------------------------
 
 def test_A13() -> StructResult:
-    raise NotImplementedError("A13 -- open theory question, resolve analytically first")
+    raise NotImplementedError(
+        "A13 -- resolved as theory; needs the Phase 2 stochastic estimator to test")
 
 
 # ---------------------------------------------------------------------------
